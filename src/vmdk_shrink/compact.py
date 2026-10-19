@@ -10,10 +10,9 @@ from __future__ import annotations
 from pathlib import Path
 
 from .console import err, info, ok, step
-from .fsops import discover_data_disk, fs_facts, unmount, zerofree
-from .guest import Guest
-from .helper_session import ensure_assets, shutdown_helper
+from .fsops import activate_lvm, check_fs, ext4_devices, fs_facts, zerofree
 from .paths import DEFAULT_PATHS, HostPaths
+from .session import attach_rw, open_session
 from .vdiskmanager import VDiskManager
 from .vmdk_parser import grain_stats
 
@@ -23,30 +22,8 @@ def _du_bytes(paths: list[Path]) -> int:
 
 
 def _extent_files(vmdk: Path) -> list[Path]:
-    stem = vmdk.with_suffix("").name  # strips .vmdk
+    stem = vmdk.with_suffix("").name
     return sorted(vmdk.parent.glob(stem + "-s*.vmdk"))
-
-
-def _zero_other_ext4(guest: Guest, *, skip_partition: str) -> list[str]:
-    """zerofree every ext4 filesystem except the data partition (e.g. boot LVs)."""
-    from .fsops import lsblk
-
-    zeroed: list[str] = []
-    devices = lsblk(guest)
-    stack = list(devices)
-    while stack:
-        dev = stack.pop()
-        stack.extend(dev.get("children") or [])
-        if dev.get("type") not in {"part", "lvm"} or dev.get("fstype") != "ext4":
-            continue
-        name = str(dev.get("name"))
-        if name == skip_partition or name.endswith(skip_partition):
-            continue
-        output = zerofree(guest, f"/dev/{name}")
-        zeroed.append(name)
-        line = output.strip().splitlines()[-1] if output.strip() else "nothing to zero"
-        info(f"zerofree /dev/{name}: {line}")
-    return zeroed
 
 
 def compact_disk(
@@ -54,15 +31,15 @@ def compact_disk(
     *,
     extra_vmdks: tuple[Path, ...] = (),
     zerofree_fs: bool = True,
-    zero_boot_lv: bool = False,
     paths: HostPaths = DEFAULT_PATHS,
-    keep_running: bool = False,
 ) -> int:
     """Compact host footprint. Returns bytes freed (negative = grew).
 
-    ``extra_vmdks`` are zerofree'd (if ext4) and compacted alongside the main
-    disk — pass the boot disk to reclaim its space too.
+    ``extra_vmdks`` are zerofree'd (every ext4 under each disk, including LVM
+    logical volumes) and compacted alongside the main disk — pass the boot
+    disk to reclaim its space too.
     """
+    vmdk = Path(vmdk).resolve()
     target_vmdks = (vmdk, *extra_vmdks)
     step(f"Compact-only mode for [val]{', '.join(v.name for v in target_vmdks)}[/val]")
     step("Filesystem size is NOT touched — capacity stays as-is")
@@ -76,25 +53,38 @@ def compact_disk(
         f"host files [val]{before / 2**30:.1f} GiB[/val] ({len(before_files)} file(s))"
     )
 
-    assets, guest = ensure_assets(vmdk.parent, attach=target_vmdks, paths=paths, boot=zerofree_fs)
-    try:
-        if guest is not None and zerofree_fs:
-            disk = discover_data_disk(guest)
-            facts = fs_facts(guest, disk.partition_path)
-            info(
-                f"data disk /dev/{disk.device} ({disk.size_bytes / 2**30:.0f} GiB), "
-                f"ext4 {facts.size_bytes / 2**30:.0f} GiB, "
-                f"{facts.free_blocks * facts.block_size / 2**30:.1f} GiB free"
-            )
-            unmount(guest)
-            step(f"zerofree [val]{disk.partition_path}[/val]")
-            output = zerofree(guest, disk.partition_path)
-            info(output.strip().splitlines()[-1] if output.strip() else "nothing to zero")
-            if zero_boot_lv:
-                _zero_other_ext4(guest, skip_partition=disk.partition)
-    finally:
-        if not keep_running:
-            shutdown_helper(assets.vmx, guest, paths=paths)
+    if zerofree_fs:
+        with open_session(vmdk.parent, paths=paths) as session:
+            ex = session.executor
+            for t in target_vmdks:
+                disk = attach_rw(session, t)
+                try:
+                    session.nbd.rescan(disk)
+                    activate_lvm(ex)
+                    devices = ext4_devices(ex, under=disk.device)
+                    if not devices:
+                        info(f"{t.name}: no ext4 filesystem found — skipping zerofree")
+                        continue
+                    for dev in devices:
+                        facts = fs_facts(ex, dev)
+                        info(
+                            f"{t.name} {dev}: ext4 {facts.size_bytes / 2**30:.0f} GiB, "
+                            f"{facts.free_blocks * facts.block_size / 2**30:.1f} GiB free"
+                        )
+                        # zerofree refuses a dirty fs; replay the journal first
+                        step(f"e2fsck -fy on [val]{dev}[/val]")
+                        check_fs(ex, dev, fix=True)
+                        step(f"zerofree [val]{dev}[/val]")
+                        output = zerofree(ex, dev)
+                        info(
+                            output.strip().splitlines()[-1]
+                            if output.strip()
+                            else "nothing to zero"
+                        )
+                except Exception as exc:  # noqa: BLE001 — best effort per disk
+                    info(f"zerofree skipped for {t.name}: {exc}")
+                finally:
+                    session.nbd.disconnect()
 
     for t in target_vmdks:
         step(f"vdiskmanager -k on [val]{t.name}[/val]")

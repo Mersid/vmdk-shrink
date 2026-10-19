@@ -1,7 +1,8 @@
-"""Locations of VMware Workstation tools and related host paths.
+"""Locations of host-side tools.
 
-Everything is overridable via :class:`HostPaths` so tests can point at fakes,
-but the defaults reflect a standard Workstation install on Windows.
+Only Docker (plus optionally ``wsl`` to load the NBD module into Docker
+Desktop's kernel) and VMware's ``vmware-vdiskmanager`` are needed on the host;
+everything else lives in the container image.
 """
 
 from __future__ import annotations
@@ -17,22 +18,23 @@ def _default_program_files() -> Path:
 
 @dataclass(frozen=True)
 class HostPaths:
-    """Filesystem locations of VMware tools and VM-related state."""
+    """Filesystem locations of host-side tools and VM-related state."""
 
+    docker: Path = Path("docker")
+    wsl: Path = Path("wsl")
     workstation_dir: Path = field(
         default_factory=lambda: _default_program_files() / "VMware" / "VMware Workstation"
     )
-    vmrun: Path = field(init=False)
     vdiskmanager: Path = field(init=False)
-    dhcp_leases: Path = Path(r"C:\ProgramData\VMware\vmnetdhcp.leases")
+    vmrun: Path = field(init=False)
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "vmrun", self.workstation_dir / "vmrun.exe")
         object.__setattr__(self, "vdiskmanager", self.workstation_dir / "vmware-vdiskmanager.exe")
+        object.__setattr__(self, "vmrun", self.workstation_dir / "vmrun.exe")
 
     def require_tools(self) -> list[Path]:
-        """Return the list of tool paths that are missing (empty list = all good)."""
-        return [p for p in (self.vmrun, self.vdiskmanager) if not p.is_file()]
+        """Return missing tool paths (empty list = all good)."""
+        return [p for p in (self.vdiskmanager, self.vmrun) if not p.is_file()]
 
 
 DEFAULT_PATHS = HostPaths()

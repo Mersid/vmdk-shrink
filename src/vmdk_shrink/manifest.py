@@ -1,7 +1,11 @@
-"""File-hash manifests: collected in the guest, diffed on the host.
+"""File-hash manifests: collected in the container, diffed on the host.
 
 The manifest is the lossless proof: every regular file's SHA-256 before and
-after the operation, diffed at the end. 400k files / ~430 GiB hashes in ~18 min.
+after the operation, diffed at the end.
+
+A single qemu-nbd connection caps around 100 MB/s (latency-bound through the
+bind mount), so hashing fans out over several read-only NBD replicas of the
+same VMDK — the bind-mount ceiling (~230 MB/s) is reached at 4 connections.
 """
 
 from __future__ import annotations
@@ -10,10 +14,11 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .guest import Guest, GuestError
+from .executor import ExecError, Executor
 
 MOUNT = "/mnt/data"
 _HASH_LINE = re.compile(r"^([0-9a-f]{64})\s+\*?(.+)$")
+_MOUNT_PREFIX = re.compile(r"^/mnt/data\d*")
 
 
 @dataclass
@@ -38,8 +43,13 @@ class ManifestDiff:
         return f"{len(self.changed)} changed, {len(self.removed)} missing, {len(self.added)} added"
 
 
-def parse_manifest_text(text: str, *, strip_prefix: str = MOUNT) -> Manifest:
-    """Parse ``sha256sum`` output; strip the mount prefix from paths."""
+def parse_manifest_text(text: str, *, strip_prefix: str | None = None) -> Manifest:
+    """Parse ``sha256sum`` output; normalize ``/mnt/data*`` mount prefixes.
+
+    Parallel hashing uses several mounts (``/mnt/data0``, ``/mnt/data1``…) of
+    the same filesystem; paths are stored without the mount prefix so the two
+    manifests are comparable.
+    """
     entries: dict[str, str] = {}
     malformed = 0
     for line in text.splitlines():
@@ -52,24 +62,59 @@ def parse_manifest_text(text: str, *, strip_prefix: str = MOUNT) -> Manifest:
         digest, path = m.groups()
         if strip_prefix and path.startswith(strip_prefix):
             path = path[len(strip_prefix) :]
+        else:
+            path = _MOUNT_PREFIX.sub("", path, count=1)
         entries[path] = digest.lower()
     if malformed:
-        raise GuestError(f"manifest parse: {malformed} malformed lines")
+        raise ExecError(f"manifest parse: {malformed} malformed lines")
     return Manifest(entries=entries)
 
 
-def collect(guest: Guest, *, mount: str = MOUNT, out_path: Path) -> Manifest:
-    """Hash every regular file under ``mount`` inside the guest, streaming to disk."""
+def collect(
+    ex: Executor,
+    *,
+    mount: str = MOUNT,
+    out_path: Path,
+    extra_mounts: tuple[str, ...] = (),
+) -> Manifest:
+    """Hash every regular file under ``mount`` (plus RO replicas), stream to host.
+
+    ``extra_mounts`` are additional read-only mounts of the SAME filesystem;
+    the file list is split round-robin across all mounts so hashing saturates
+    the bind-mount throughput instead of one NBD connection.
+    """
     out_path.parent.mkdir(parents=True, exist_ok=True)
     raw_file = out_path.with_suffix(".raw")
-    cmd = f"find {mount} -xdev -type f -print0 | xargs -0 -n 200 -P 4 sha256sum 2>/dev/null"
+
+    mounts = [mount, *extra_mounts]
+    if len(mounts) == 1:
+        cmd = f"find {mount} -xdev -type f | xargs -d '\\n' -n 200 -P 4 sha256sum 2>/dev/null"
+    else:
+        # round-robin the file list across replicas; newline-delimited (the
+        # manifest is line-based, and mawk cannot use NUL as RS).
+        parts = []
+        for i, m in enumerate(mounts):
+            parts.append(
+                f"find {m} -xdev -type f | awk 'NR % {len(mounts)} == {i}' "
+                f"| xargs -d '\\n' -n 200 -P 4 sha256sum 2>/dev/null &"
+            )
+        cmd = " ".join(parts) + " wait"
+
+    # coverage guard: the round-robin split must not silently drop files
+    count = ex.run(f"find {mount} -xdev -type f | wc -l", timeout=3600).output.strip()
+    expected = int(count) if count.isdigit() else -1
 
     with raw_file.open("w", encoding="utf-8", newline="\n") as sink:
-        result = guest.stream(cmd, timeout=7200, chunk_cb=sink.write)
+        result = ex.stream(cmd, timeout=14400, chunk_cb=sink.write)
         if result.exit_code != 0:
-            raise GuestError(f"hashing failed rc={result.exit_code}")
+            raise ExecError(f"hashing failed rc={result.exit_code}")
 
     manifest = parse_manifest_text(raw_file.read_text(encoding="utf-8", errors="replace"))
+    if expected >= 0 and len(manifest) != expected:
+        raise ExecError(
+            f"manifest coverage mismatch: hashed {len(manifest)} files, "
+            f"filesystem has {expected}"
+        )
     return manifest
 
 

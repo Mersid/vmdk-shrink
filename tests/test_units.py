@@ -1,4 +1,4 @@
-"""Tests for manifest parsing, diffing, lease parsing, VMX generation, autorun."""
+"""Tests for manifest parsing/diffing, NBD device math, path mapping, fs parsing."""
 
 from __future__ import annotations
 
@@ -6,10 +6,11 @@ from pathlib import Path
 
 import pytest
 
-from vmdk_shrink.helper_boot import normalize_mac, parse_leases
-from vmdk_shrink.helper_vmx import static_mac, write_helper_vmx
-from vmdk_shrink.iso_patch import IsoError, append_boot_param
+from vmdk_shrink.container import Container, ContainerError
+from vmdk_shrink.executor import ExecResult
+from vmdk_shrink.fsops import FsFacts, fs_facts, nbd_written, partition_geometry
 from vmdk_shrink.manifest import diff, load, parse_manifest_text
+from vmdk_shrink.nbd import NbdDisk
 from vmdk_shrink.paths import HostPaths
 
 H1 = "a" * 64
@@ -23,17 +24,21 @@ def write_manifest(path: Path, lines: list[str]) -> Path:
     return path
 
 
+# ------------------------------------------------------------- manifest ----
 def test_parse_manifest_strips_mount_prefix() -> None:
     m = parse_manifest_text(f"{H1}  /mnt/data/etc/hosts\n{H2}  /mnt/data/boot/vmlinuz\n")
     assert m.entries == {"/etc/hosts": H1, "/boot/vmlinuz": H2}
 
 
+def test_parse_manifest_normalizes_replica_mounts() -> None:
+    m = parse_manifest_text(f"{H1}  /mnt/data0/a\n{H2}  /mnt/data1/b\n{H3}  /mnt/data22/c\n")
+    assert m.entries == {"/a": H1, "/b": H2, "/c": H3}
+
+
 def test_parse_manifest_rejects_malformed() -> None:
-    import pytest
+    from vmdk_shrink.executor import ExecError
 
-    from vmdk_shrink.guest import GuestError
-
-    with pytest.raises(GuestError):
+    with pytest.raises(ExecError):
         parse_manifest_text("not-a-manifest-line\n")
 
 
@@ -57,96 +62,102 @@ def test_load_roundtrip(tmp_path: Path) -> None:
     assert load(p).entries == {"/a": H1, "/b": H2}
 
 
-LEASES = """
-lease 192.168.223.129 {
-  starts 3 2026/10/04 22:10:01;
-  ends 3 2026/10/04 22:20:01;
-  hardware ethernet 00:50:56:2d:70:01;
-}
-lease 192.168.223.130 {
-  starts 3 2026/10/04 22:15:01;
-  hardware ethernet 00:50:56:aa:bb:cc;
-}
-lease 192.168.223.131 {
-  hardware ethernet 00:50:56-2D-70-01;
-}
-"""
+# ---------------------------------------------------------------- nbd ----
+def test_nbd_disk_partition_nodes() -> None:
+    disk = NbdDisk(index=0, minors_per_disk=32)
+    assert disk.device == "/dev/nbd0"
+    assert disk.partition(1) == "/dev/nbd0p1"
+    assert disk.partition_minor(1) == 1
 
 
-def test_parse_leases_finds_static_mac(tmp_path: Path) -> None:
-    f = tmp_path / "vmnetdhcp.leases"
-    f.write_text(LEASES, encoding="utf-8")
-    rec = parse_leases(f, static_mac())
-    assert rec is not None and rec.ip == "192.168.223.131"  # later block wins
+def test_nbd_disk_partition_minors_second_device() -> None:
+    disk = NbdDisk(index=1, minors_per_disk=32)
+    assert disk.device == "/dev/nbd1"
+    assert disk.partition_minor(1) == 33
+    assert disk.partition_minor(4) == 36
 
 
-def test_parse_leases_missing(tmp_path: Path) -> None:
-    f = tmp_path / "nope.leases"
-    assert parse_leases(f, static_mac()) is None
+# ----------------------------------------------------------- container ----
+def test_container_path_mapping(tmp_path: Path) -> None:
+    vm_dir = tmp_path / "vm"
+    (vm_dir / "sub").mkdir(parents=True)
+    c = Container(((vm_dir, "/work"),))
+    assert c.to_container_path(vm_dir / "disk.vmdk") == "/work/disk.vmdk"
+    assert c.to_container_path(vm_dir / "sub" / "x.vmdk") == "/work/sub/x.vmdk"
+    with pytest.raises(ContainerError):
+        c.to_container_path(tmp_path / "elsewhere.vmdk")
 
 
-def test_normalize_mac() -> None:
-    assert normalize_mac("00-50-56-2D-70-01") == "00:50:56:2d:70:01"
+# -------------------------------------------------------------- fsops ----
+class FakeExec:
+    """Minimal Executor returning canned output."""
+
+    def __init__(self, outputs: dict[str, str]) -> None:
+        self._outputs = outputs
+        self.commands: list[str] = []
+
+    def run(self, command: str, *, timeout: float = 120.0, check: bool = True) -> ExecResult:
+        self.commands.append(command)
+        for key, out in self._outputs.items():
+            if key in command:
+                return ExecResult(command=command, exit_code=0, output=out)
+        return ExecResult(command=command, exit_code=0, output="")
+
+    def stream(self, command, *, timeout=7200.0, chunk_cb=None):  # type: ignore[no-untyped-def]
+        return self.run(command)
 
 
-def test_helper_vmx_contents(tmp_path: Path) -> None:
-    vmx = write_helper_vmx(
-        tmp_path,
-        iso_path=Path("C:/iso/x.iso"),
-        scratch_path=Path("C:/vms/scratch.vmdk"),
-        attach=(Path("C:/vms/data.vmdk"), Path("C:/vms/boot.vmdk")),
-        vm_name="shrink-helper",
-        mac_suffix="2d:70:01",
+def test_fs_facts_parses_dumpe2fs() -> None:
+    out = (
+        "Block size:               4096\n"
+        "Block count:              262135880\n"
+        "Free blocks:              120000000\n"
     )
-    text = vmx.read_text(encoding="utf-8")
-    assert 'displayName = "shrink-helper"' in text
-    assert 'ethernet0.address = "00:50:56:2d:70:01"' in text
-    assert 'scsi0:0.fileName = "C:\\iso\\x.iso"' in text
-    assert 'scsi0:1.fileName = "C:\\vms\\scratch.vmdk"' in text
-    assert 'scsi0:2.fileName = "C:\\vms\\data.vmdk"' in text
-    assert 'scsi0:3.fileName = "C:\\vms\\boot.vmdk"' in text
-    assert 'RemoteDisplay.vnc.enabled = "TRUE"' in text
-    assert 'bios.bootOrder = "cdrom,hdd"' in text
+    ex = FakeExec({"dumpe2fs": out})
+    facts = fs_facts(ex, "/dev/nbd0p1")
+    assert isinstance(facts, FsFacts)
+    assert facts.block_size == 4096
+    assert facts.block_count == 262135880
+    assert facts.used_gib == pytest.approx((262135880 - 120000000) * 4096 / 2**30)
 
 
-SLACK = b"# " + b"#" * 46 + b"\n"
-
-
-def test_append_boot_param_crlf_and_padding() -> None:
-    cfg = (
-        b"DEFAULT select\r\nLABEL sys\r\n"
-        b"APPEND archisobasedir=x quiet\r\nLABEL other\r\nAPPEND foo\r\n"
-        + SLACK.replace(b"\n", b"\r\n")
+def test_nbd_written_reads_write_sectors_not_inflight() -> None:
+    # Field layout (0-indexed): 6 = write sectors, 8 = in_flight. The captured
+    # stall-scene line from /sys/block/nbd0/stat: in_flight was 0 while 16 GiB
+    # had been written — indexing field 8 would falsely report "no progress".
+    # noqa: E501 kept as one literal so the column positions are self-evident
+    line = (
+        "  260297        0 33316216  2045667   242300  3912648 33501808 36535257"
+        "        0  2052736 38583591       16        0 62914568        1        4     2665\n"
     )
-    out = append_boot_param(cfg, "rootpass=pw")
-    assert len(out) == len(cfg)
-    lines = out.decode("utf-8").splitlines()
-    assert "APPEND archisobasedir=x quiet rootpass=pw" in lines
-    assert out.startswith(b"DEFAULT select\r\n")
-    # the pad line is an unterminated trailing comment
-    assert out.count(b"\r\n") == cfg.count(b"\r\n") - 1
+    ex = FakeExec({"stat": line})
+    assert nbd_written(ex, "/dev/nbd0") == 33501808
 
 
-def test_append_boot_param_lf_only() -> None:
-    cfg = b"APPEND archisobasedir=sysresccd iomem=relaxed\n" + SLACK
-    out = append_boot_param(cfg, "rootpass=pw")
-    assert len(out) == len(cfg)
-    assert out.startswith(b"APPEND archisobasedir=sysresccd iomem=relaxed rootpass=pw\n")
+def test_partition_geometry_parses_sgdisk() -> None:
+    out = (
+        "Disk /dev/nbd0: 2097152000 sectors, 1000.0 GiB\n"
+        "Number Start (sector)    End (sector)  Size       Code  Name\n"
+        "   1           44944      2097131983   1000.0 GiB  8300  Linux filesystem\n"
+    )
+    ex = FakeExec({"sgdisk -p": out})
+    geo = partition_geometry(ex, "/dev/nbd0")
+    assert geo.start_lba == 44944
+    assert geo.end_lba == 2097131983
 
 
-def test_append_boot_param_falls_back_to_first_append() -> None:
-    cfg = b"FOO bar\nAPPEND some args\n" + SLACK
-    out = append_boot_param(cfg, "rootpass=pw")
-    assert b"APPEND some args rootpass=pw" in out
-    assert len(out) == len(cfg)
+def test_partition_geometry_missing_raises() -> None:
+    from vmdk_shrink.fsops import FsError
+
+    ex = FakeExec({"sgdisk -p": "Disk /dev/nbd0: 0 sectors\n"})
+    with pytest.raises(FsError):
+        partition_geometry(ex, "/dev/nbd0")
 
 
-def test_append_boot_param_no_slack_raises() -> None:
-    cfg = b"APPEND archisobasedir=x\n# short\n"
-    with pytest.raises(IsoError):
-        append_boot_param(cfg, "rootpass=a-much-longer-password-than-the-slack-allows")
-
-
-def test_host_paths_missing_tools(tmp_path: Path) -> None:
+# ------------------------------------------------------------- paths ----
+def test_host_paths_requires_vdiskmanager(tmp_path: Path) -> None:
     paths = HostPaths(workstation_dir=tmp_path)
-    assert len(paths.require_tools()) == 2
+    assert paths.require_tools() == [paths.vdiskmanager, paths.vmrun]
+    (tmp_path / "vmware-vdiskmanager.exe").write_text("", encoding="utf-8")
+    (tmp_path / "vmrun.exe").write_text("", encoding="utf-8")
+    assert paths.require_tools() == []

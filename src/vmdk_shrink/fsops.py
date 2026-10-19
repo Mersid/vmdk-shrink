@@ -1,34 +1,36 @@
-"""Guest-side filesystem and partition operations for the ext4 data disk.
+"""Filesystem and partition operations, run through an :class:`Executor`.
 
-Everything here runs inside the helper VM over SSH. The data disk is always
-identified by *size* (largest disk attached) — device letters renumber between
-boots, and trusting them corrupts things.
+The device is explicit (``/dev/nbd0p1`` from :mod:`vmdk_shrink.nbd`) — there is
+no more "find the biggest disk" discovery, because the container attaches
+exactly one VMDK per NBD slot.
 """
 
 from __future__ import annotations
 
-import contextlib
 import json
 import re
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-from .guest import Guest, GuestError
+from .console import warn
+from .executor import ExecError, Executor
 
 
-class GuestFsError(RuntimeError):
+class FsError(RuntimeError):
     pass
 
 
-@dataclass(frozen=True)
-class DiskInfo:
-    device: str  # e.g. "sdb"
-    size_bytes: int
-    partition: str  # e.g. "sdb1"
+class StallError(FsError):
+    """A watched phase made no I/O progress for too long.
 
-    @property
-    def partition_path(self) -> str:
-        return f"/dev/{self.partition}"
+    Root cause is the vp9fs.dll Tflush race (microsoft/WSL#41702): Docker's
+    drvfs layer occasionally loses a request's completion, and everything
+    queued behind it wedges. Recovery is a fresh container (a new 9p session
+    works immediately); no ``wsl --shutdown`` needed unless the whole mount
+    dies.
+    """
 
 
 @dataclass(frozen=True)
@@ -57,48 +59,8 @@ class PartitionGeometry:
     end_lba: int
 
 
-def lsblk(guest: Guest) -> list[dict[str, Any]]:
-    result = guest.run("lsblk -J -b -o NAME,SIZE,TYPE,FSTYPE", check=True)
-    parsed = json.loads(result.output)
-    devices: list[dict[str, Any]] = parsed.get("blockdevices", [])
-    return devices
-
-
-def largest_disk(guest: Guest, *, scratch_size_bytes: int = 2**30) -> tuple[str, int]:
-    """Name and size of the largest attached disk, partitions NOT required.
-
-    Used before GPT repair: a disk whose backup GPT lies beyond its (shrunk)
-    end registers NO partitions in the kernel until ``sgdisk -e`` + rescan.
-    """
-    candidates: list[tuple[int, str]] = []
-    for dev in lsblk(guest):
-        if dev.get("type") == "disk" and int(dev.get("size", 0)) > scratch_size_bytes:
-            candidates.append((int(dev["size"]), str(dev.get("name", ""))))
-    if not candidates:
-        raise GuestFsError("no attached disk larger than the scratch disk")
-    size, name = max(candidates)
-    return name, size
-
-
-def discover_data_disk(guest: Guest, *, scratch_size_bytes: int = 2**30) -> DiskInfo:
-    """The data disk = largest attached disk (scratch is 1 GiB, OS disk smaller)."""
-    name, size = largest_disk(guest, scratch_size_bytes=scratch_size_bytes)
-    part = _first_partition(guest, name)
-    return DiskInfo(device=name, size_bytes=size, partition=part)
-
-
-def _first_partition(guest: Guest, disk: str) -> str:
-    result = guest.run(f"lsblk -J -b -o NAME,TYPE /dev/{disk}", check=True)
-    parsed = json.loads(result.output)
-    for dev in parsed.get("blockdevices", []):
-        for child in dev.get("children") or []:
-            if child.get("type") == "part":
-                return str(child["name"])
-    raise GuestFsError(f"disk {disk} has no partitions")
-
-
-def fs_facts(guest: Guest, partition_path: str) -> FsFacts:
-    result = guest.run(f"dumpe2fs -h {partition_path}", check=True)
+def fs_facts(ex: Executor, partition_path: str) -> FsFacts:
+    result = ex.run(f"dumpe2fs -h {partition_path}", timeout=120)
     text = result.output
     bs = int(_capture(text, r"Block size:\s+(\d+)"))
     bc = int(_capture(text, r"Block count:\s+(\d+)"))
@@ -106,36 +68,51 @@ def fs_facts(guest: Guest, partition_path: str) -> FsFacts:
     return FsFacts(block_size=bs, block_count=bc, free_blocks=fb)
 
 
-def partition_geometry(guest: Guest, disk: str, number: int = 1) -> PartitionGeometry:
-    result = guest.run(f"sgdisk -p /dev/{disk}", check=True)
+def count_partitions(ex: Executor, disk: str) -> int:
+    """Number of partitions sgdisk reports on *disk* (GPT or MBR layout)."""
+    result = ex.run(f"sgdisk -p {disk}", timeout=60)
+    return sum(
+        1
+        for line in result.output.splitlines()
+        if re.match(r"^\s*\d+\s+\d+\s+\d+\s+", line)
+    )
+
+
+def fs_type(ex: Executor, partition_path: str) -> str:
+    """Filesystem type as util-linux blkid reports it (e.g. 'ext4', 'xfs')."""
+    result = ex.run(f"blkid -o value -s TYPE {partition_path}", timeout=30)
+    return result.output.strip().lower()
+
+
+def partition_geometry(ex: Executor, disk: str, number: int = 1) -> PartitionGeometry:
+    result = ex.run(f"sgdisk -p {disk}", timeout=60)
     for line in result.output.splitlines():
         m = re.match(rf"^\s*{number}\s+(\d+)\s+(\d+)\s+", line)
         if m:
             return PartitionGeometry(
                 number=number, start_lba=int(m.group(1)), end_lba=int(m.group(2))
             )
-    raise GuestFsError(f"partition {number} not found on /dev/{disk}")
+    raise FsError(f"partition {number} not found on {disk}")
 
 
-def check_fs(guest: Guest, partition_path: str, *, fix: bool = False) -> str:
+def check_fs(ex: Executor, partition_path: str, *, fix: bool = False) -> str:
     """Run e2fsck; exits 0/1/2 are success (1 = errors corrected, 2 = +reboot)."""
     flag = "-fy" if fix else "-fn"
-    cmd = f"e2fsck {flag} {partition_path}"
-    result = guest.run(cmd, timeout=3600, check=False)
+    result = ex.run(f"e2fsck {flag} {partition_path}", timeout=14400, check=False)
     if result.exit_code not in (0, 1, 2):
-        raise GuestFsError(
+        raise FsError(
             f"e2fsck failed (exit {result.exit_code}, uncorrected errors):\n{result.output[-2000:]}"
         )
     return result.output
 
 
-def resize_fs(guest: Guest, partition_path: str, target_gib: int) -> str:
-    result = guest.run(f"resize2fs {partition_path} {target_gib}G", timeout=3600, check=True)
-    return result.output
+def resize_fs(ex: Executor, partition_path: str, target_gib: int) -> str:
+    # a 1 TiB fs on a spinning array can exceed 2 h of block relocation
+    return ex.run(f"resize2fs {partition_path} {target_gib}G", timeout=21600).output
 
 
 def recreate_partition(
-    guest: Guest,
+    ex: Executor,
     disk: str,
     *,
     start_lba: int,
@@ -149,47 +126,155 @@ def recreate_partition(
     superblock would no longer be found ("Bad magic number"). ``-a 1`` disables
     alignment so the start stays put.
     """
-    guest.run(f"sgdisk --delete={number} /dev/{disk}", check=True)
-    guest.run(
-        f"sgdisk -a 1 --new={number}:{start_lba}:{end_lba} "
-        f"--typecode={number}:{typecode} /dev/{disk}",
-        check=True,
+    ex.run(f"sgdisk --delete={number} {disk}", timeout=120)
+    ex.run(
+        f"sgdisk -a 1 --new={number}:{start_lba}:{end_lba} --typecode={number}:{typecode} {disk}",
+        timeout=120,
     )
-    guest.run(f"partprobe /dev/{disk}", check=True)
 
 
-def relocate_gpt_backup(guest: Guest, disk: str) -> str:
-    """Move the backup GPT header to the disk end and rescan partitions.
+def relocate_gpt_backup(ex: Executor, disk: str) -> str:
+    """Move the backup GPT header to the disk end (after a capacity drop)."""
+    return ex.run(f"sgdisk -e {disk}", timeout=120).output
 
-    After the capacity drop the old backup header lies beyond the disk end;
-    the kernel then registers NO partitions at all until this runs.
+
+def zerofree(ex: Executor, device_path: str) -> str:
+    return ex.run(f"zerofree -v {device_path}", timeout=14400).output
+
+
+def nbd_written(ex: Executor, device: str = "/dev/nbd0") -> int:
+    """Sectors written through the NBD device — the progress signal for watchdogs.
+
+    ``/sys/block/<dev>/stat`` fields (0-indexed): 6 = write sectors; 8 is
+    ``in_flight`` (an instantaneous queue depth, NOT a progress counter — it
+    reads 0 between write bursts and would falsely report a stall).
     """
-    result = guest.run(f"sgdisk -e /dev/{disk}", check=True)
-    guest.run(f"partprobe /dev/{disk}", check=True)
-    return result.output
+    result = ex.run(
+        f"cat /sys/block/{device.removeprefix('/dev/')}/stat", timeout=30, check=False
+    )
+    try:
+        return int(result.output.split()[6])
+    except (IndexError, ValueError):
+        return -1
 
 
-def zerofree(guest: Guest, device_path: str) -> str:
-    result = guest.run(f"zerofree -v {device_path}", timeout=3600, check=True)
-    return result.output
+def run_watched(
+    ex: Executor,
+    command: str,
+    *,
+    phase: str,
+    progress: Callable[[], int],
+    max_runtime_s: float,
+    interval_s: float = 300.0,
+    stall_limit: int = 3,
+) -> str:
+    """Run a long phase detached and poll its progress; raise :class:`StallError`.
+
+    The command runs via ``docker exec -d`` so a wedged drvfs connection can
+    never hang the control plane — the polls read local container files only.
+    Completion is detected through an ``EXIT=<n>`` marker the wrapper appends
+    to the log, so a crashed phase is told apart from a finished one.
+    """
+    log = f"/tmp/{phase}.log"
+    ex.run_detached(f"( {command}; echo EXIT=$? ) > {log} 2>&1")
+    deadline = time.monotonic() + max_runtime_s
+    frozen = 0
+    last = progress()
+    while time.monotonic() < deadline:
+        time.sleep(interval_s)
+        tail = ex.run(f"cat {log}", timeout=30, check=False).output
+        if "EXIT=" in tail:
+            marker = tail.rsplit("EXIT=", 1)[1].split()[0]
+            try:
+                code = int(marker)
+            except ValueError as exc:
+                raise FsError(f"{phase}: unreadable exit marker in {log}") from exc
+            if code != 0:
+                raise FsError(f"{phase} failed (exit {code}):\n{tail[-2000:]}")
+            return tail
+        now = progress()
+        if now < 0:
+            # Unreadable counter — the control plane (docker engine/exec) itself
+            # is wedged. Treat exactly like a frozen counter: once the engine
+            # stops answering, progress can never resume on its own.
+            frozen += 1
+            warn(
+                f"{phase}: progress unreadable for {frozen * interval_s / 60:.0f} min "
+                f"(engine wedged?); log tail: {tail.strip()[-300:] or '<empty>'}"
+            )
+            if frozen >= stall_limit:
+                raise StallError(
+                    f"{phase}: control plane unreadable for "
+                    f"{stall_limit * interval_s / 60:.0f} min; "
+                    f"log tail: {tail.strip()[-500:] or '<empty>'}"
+                )
+        elif 0 <= now == last:
+            frozen += 1
+            warn(
+                f"{phase}: no I/O progress for {frozen * interval_s / 60:.0f} min; "
+                f"log tail: {tail.strip()[-300:] or '<empty>'}"
+            )
+            if frozen >= stall_limit:
+                raise StallError(
+                    f"{phase}: no I/O progress for {stall_limit * interval_s / 60:.0f} min; "
+                    f"log tail: {tail.strip()[-500:] or '<empty>'}"
+                )
+        else:
+            frozen = 0
+        last = now
+    raise StallError(f"{phase}: exceeded the {max_runtime_s / 60:.0f} min runtime limit")
 
 
-def mount_ro(guest: Guest, partition_path: str, mount: str = "/mnt/data") -> None:
-    guest.run(f"mkdir -p {mount} && mount -o ro {partition_path} {mount}", check=True)
+def mount_ro(ex: Executor, partition_path: str, mount: str = "/mnt/data") -> None:
+    ex.run(f"mkdir -p {mount} && mount -o ro {partition_path} {mount}", timeout=120)
 
 
-def unmount(guest: Guest, mount: str = "/mnt/data") -> None:
-    guest.run(f"umount {mount} || true")
+def unmount(ex: Executor, mount: str = "/mnt/data") -> None:
+    ex.run(f"umount {mount} || true", timeout=120, check=False)
 
 
-def poweroff(guest: Guest) -> None:
-    # connection drop as the VM powers off is expected
-    with contextlib.suppress(GuestError):
-        guest.run("poweroff", timeout=10)
+def activate_lvm(ex: Executor) -> None:
+    """Activate visible volume groups (containers get no udev auto-activation)."""
+    ex.run("vgchange -ay 2>/dev/null || true", timeout=180, check=False)
+
+
+def ext4_devices(ex: Executor, *, under: str | None = None) -> list[str]:
+    """Ext4 block devices in the container, optionally scoped to one disk tree.
+
+    ``under`` (e.g. ``/dev/nbd1``) limits the walk to that disk's subtree —
+    its partitions plus any LVM logical volumes stacked on them.
+    """
+    out = ex.run("lsblk -J -b -o NAME,TYPE,FSTYPE", timeout=60, check=False).output
+    try:
+        parsed = json.loads(out)
+    except json.JSONDecodeError as exc:
+        raise ExecError(f"lsblk parse failure: {out[:200]}") from exc
+
+    roots: list[dict[str, Any]] = list(parsed.get("blockdevices", []))
+    if under is not None:
+        wanted = under.removeprefix("/dev/")
+        subtree: list[dict[str, Any]] = []
+        stack = list(roots)
+        while stack:
+            node = stack.pop()
+            if str(node.get("name")) == wanted:
+                subtree.append(node)
+            else:
+                stack.extend(node.get("children") or [])
+        roots = subtree
+
+    names: list[str] = []
+    stack = list(roots)
+    while stack:
+        dev = stack.pop()
+        stack.extend(dev.get("children") or [])
+        if dev.get("fstype") == "ext4":
+            names.append(f"/dev/{dev['name']}")
+    return names
 
 
 def _capture(text: str, pattern: str) -> str:
     m = re.search(pattern, text)
     if not m:
-        raise GuestFsError(f"pattern not found: {pattern}")
+        raise FsError(f"pattern not found: {pattern}")
     return m.group(1)

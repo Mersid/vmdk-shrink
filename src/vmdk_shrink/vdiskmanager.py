@@ -8,6 +8,16 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from rich.progress import (
+    BarColumn,
+    Progress,
+    TaskID,
+    TaskProgressColumn,
+    TextColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+)
+
 from .console import console
 from .paths import DEFAULT_PATHS, HostPaths
 
@@ -61,8 +71,9 @@ class VDiskManager:
         stdout = proc.stdout
         assert stdout is not None
         last_pct = -1
+        rc_holder: list[int] = []
 
-        def _pump() -> None:
+        def _pump(progress: Progress, task: TaskID) -> None:
             nonlocal last_pct
             buf = ""
             while True:
@@ -78,17 +89,31 @@ class VDiskManager:
                             pct = int(digits.split()[0])
                             if pct != last_pct and pct <= 100:
                                 last_pct = pct
-                                console.print(f"\r[info]compact[/info] {pct:3d}%", end="")
+                                progress.update(task, completed=pct)
                     buf = ""
 
-        t = threading.Thread(target=_pump, daemon=True)
-        t.start()
-        rc = proc.wait()
-        t.join(timeout=5)
-        console.print()
+        # Rich Progress drives the in-place redraw: a raw CR inside
+        # console.print is emitted literally (Rich counts columns and
+        # soft-wraps), so every "compact N%" printed side by side.
+        with Progress(
+            TextColumn("[info]compact[/info]"),
+            BarColumn(style="dim white", complete_style="cyan", finished_style="bright_cyan"),
+            TaskProgressColumn(),
+            TimeElapsedColumn(),
+            TimeRemainingColumn(),
+            # -k emits Shrink: lines ~1/min; rich default 30 s speed window
+            # starves (burst samples share a timestamp -> speed None ->
+            # ETA flashes in and out). One hour covers the whole run.
+            speed_estimate_period=3600,
+            console=console,
+        ) as progress:
+            task = progress.add_task("", total=100)
+            t = threading.Thread(target=_pump, args=(progress, task), daemon=True)
+            t.start()
+            rc_holder.append(proc.wait())
+            t.join(timeout=5)
+            progress.update(task, completed=max(last_pct, 0))
+        rc = rc_holder[0]
         if rc != 0:
             raise VDiskManagerError(f"compact of {vmdk} failed rc={rc}")
         return CompactResult(started=started, finished=time.monotonic())
-
-    def create_scratch(self, vmdk: Path, size_mb: int = 1024) -> None:
-        self._run("-c", "-s", f"{size_mb}MB", "-a", "lsilogic", "-t", "3", str(vmdk), timeout=300)

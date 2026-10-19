@@ -51,6 +51,16 @@ class DescriptorPlan:
         return self.new_capacity_sectors * SECTOR / 2**30
 
 
+def _extent_sectors(extents: list[tuple[int, str]]) -> int:
+    """Sector span of the disk's extents, derived from the descriptor.
+
+    The original VMware-created disk uses ~32 GiB extents, but a descriptor
+    written by ``qemu-img convert`` uses true 2 GiB extents — never assume a
+    fixed size.
+    """
+    return extents[0][0] if extents else EXTENT_SECTORS
+
+
 def compute_plan(descriptor: Path, fs_end_sector: int) -> DescriptorPlan:
     """Which extents must survive so the descriptor still covers ``fs_end_sector``.
 
@@ -60,14 +70,15 @@ def compute_plan(descriptor: Path, fs_end_sector: int) -> DescriptorPlan:
     ``fs_end_sector`` that already includes the desired tail slack.
     """
     extents = extent_list(descriptor)
+    extent_sectors = _extent_sectors(extents)
     keep = 1
-    while keep < len(extents) and keep * EXTENT_SECTORS < fs_end_sector:
+    while keep < len(extents) and keep * extent_sectors < fs_end_sector:
         keep += 1
     orphan_names = {name for _, name in extents[keep:]}
     orphans = tuple(p for p in (descriptor.parent / n for n in orphan_names) if p.is_file())
     return DescriptorPlan(
         keep_extents=keep,
-        new_capacity_sectors=keep * EXTENT_SECTORS,
+        new_capacity_sectors=keep * extent_sectors,
         orphan_files=orphans,
     )
 

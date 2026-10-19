@@ -10,13 +10,13 @@ from .console import console, err, info, ok, warn
 
 app = typer.Typer(
     name="vmdk",
-    help="Losslessly shrink or compact VMware ext4 VMDKs from Windows.",
+    help="Losslessly shrink or compact VMware ext4 VMDKs using a Docker helper.",
     no_args_is_help=True,
     add_completion=False,
     pretty_exceptions_show_locals=False,
 )
-helper_app = typer.Typer(help="Build/boot the headless Linux helper VM.", no_args_is_help=True)
-app.add_typer(helper_app, name="helper")
+image_app = typer.Typer(help="Build/remove the container image.", no_args_is_help=True)
+app.add_typer(image_app, name="image")
 
 
 def _fail(msg: str) -> None:
@@ -24,55 +24,43 @@ def _fail(msg: str) -> None:
     raise typer.Exit(code=1)
 
 
-# ---------------------------------------------------------------- helper ----
-@helper_app.command("build")
-def helper_build(
-    vm_dir: Path = typer.Argument(
-        ..., exists=True, file_okay=False, help="VM directory (contains the .vmx/.vmdk files)"
+# ---------------------------------------------------------------- image ----
+@image_app.command("build")
+def image_build(
+    dockerfile: Path = typer.Option(
+        None, "--dockerfile", help="Dockerfile to build from (default: the packaged one)"
     ),
-    attach: list[Path] = typer.Option(
-        [], "--attach", help="Target VMDK(s) to attach to the helper (repeatable)"
-    ),
-    iso: Path | None = typer.Option(
-        None, "--iso", help="Use a specific live ISO instead of downloading SystemRescue"
-    ),
-    no_boot: bool = typer.Option(
-        False, "--no-boot", help="Create files only; do not boot the helper"
-    ),
-    boot_only: bool = typer.Option(
-        False, "--boot-only", help="Boot an existing helper without re-creating assets"
-    ),
+    force: bool = typer.Option(False, "--force", help="Rebuild even if the image exists"),
 ) -> None:
-    """Download/patch the live ISO, write the helper VMX, (optionally) boot + verify SSH."""
-    from .helper_session import ensure_assets
+    """Build the container image (auto-run by shrink/compact when missing)."""
+    from .container import Container
+    from .session import default_dockerfile
 
-    attach = [a.resolve() for a in attach]
-    for a in attach:
-        if not a.is_file():
-            _fail(f"attached disk not found: {a}")
-    assets, guest = ensure_assets(
-        vm_dir.resolve(), attach=tuple(attach), local_iso=iso, boot=not no_boot
-    )
-    ok(f"helper assets ready: {assets.vmx}")
-    if guest is not None:
-        probe = guest.run("lsblk -d -o NAME,SIZE | tail -n +2")
-        info("guest sees disks:")
-        console.print(probe.output)
-        guest.close()
+    df = dockerfile or default_dockerfile()
+    if not df.is_file():
+        _fail(f"Dockerfile not found: {df}")
+    c = Container(())
+    c.build_image(df, force=force)
 
 
-@helper_app.command("down")
-def helper_down(
-    vm_dir: Path = typer.Argument(..., exists=True, file_okay=False),
-) -> None:
-    """Hard-stop the helper VM if it is running."""
-    from .helper_session import HELPER_NAME, shutdown_helper
+@image_app.command("rm")
+def image_rm() -> None:
+    """Remove the container image (full cleanup; ``docker rm`` handles the rest)."""
+    from .container import Container
 
-    vmx = vm_dir.resolve() / f"{HELPER_NAME}.vmx"
-    if not vmx.is_file():
-        _fail(f"no helper VMX at {vmx}")
-    shutdown_helper(vmx, None)
-    ok("helper stopped")
+    Container(()).remove_image()
+    ok("image removed")
+
+
+@image_app.command("ls")
+def image_ls() -> None:
+    """Show whether the image is present."""
+    from .container import IMAGE_TAG, Container
+
+    if Container(()).image_exists():
+        ok(f"present: {IMAGE_TAG}")
+    else:
+        warn(f"not built: {IMAGE_TAG}")
 
 
 # --------------------------------------------------------------- inspect ----
@@ -81,7 +69,7 @@ def inspect(vmdk: Path = typer.Argument(..., exists=True, dir_okay=False)) -> No
     """Report a VMDK's capacity, extents, and truly-allocated (data) bytes."""
     from rich.table import Table
 
-    from .vmdk_parser import extent_list, grain_stats
+    from .vmdk_parser import extent_list, grain_stats, host_footprint_bytes
 
     stats = grain_stats(vmdk)
     extents = extent_list(vmdk)
@@ -89,13 +77,11 @@ def inspect(vmdk: Path = typer.Argument(..., exists=True, dir_okay=False)) -> No
     table.add_row("capacity", f"{stats.capacity_bytes / 2**30:.1f} GiB")
     table.add_row("extents", str(len(extents)))
     table.add_row("allocated (data)", f"[val]{stats.allocated_bytes / 2**30:.1f} GiB[/val]")
-    host = vmdk.stat().st_size + sum(
-        p.stat().st_size for p in vmdk.parent.glob(vmdk.with_suffix("").name + "-s*.vmdk")
-    )
-    table.add_row("host footprint", f"{host / 2**30:.1f} GiB")
+    table.add_row("host footprint", f"{host_footprint_bytes(vmdk) / 2**30:.1f} GiB")
     table.add_row(
         "compact ceiling",
-        f"{(host - stats.allocated_bytes) / 2**30:.2f} GiB reclaimable by -k alone",
+        f"{(host_footprint_bytes(vmdk) - stats.allocated_bytes) / 2**30:.2f} GiB "
+        "reclaimable by -k alone",
     )
     console.print(table)
 
@@ -103,22 +89,25 @@ def inspect(vmdk: Path = typer.Argument(..., exists=True, dir_okay=False)) -> No
 # ---------------------------------------------------------------- status ----
 @app.command()
 def status(vm_dir: Path = typer.Argument(..., exists=True, file_okay=False)) -> None:
-    """Show running VMs, lock dirs, and per-disk host footprints in a VM dir."""
-    from .vmrun import Vmrun
+    """Show the helper container state, lock dirs, and per-disk host footprints."""
+    from .container import Container
 
-    for vm in Vmrun().list():
-        ok(f"running: {vm.vmx}")
+    status_line = Container(()).running_status()
+    if status_line:
+        ok(f"container running: {status_line}")
+    else:
+        info("helper container not running")
+
     for lock in vm_dir.glob("*.lck"):
         warn(f"stale lock dir: {lock.name}")
     disks = sorted(vm_dir.glob("*.vmdk"))
     if not disks:
         info("no .vmdk files here")
         return
+    from .vmdk_parser import host_footprint_bytes
+
     for d in disks:
-        host = d.stat().st_size + sum(
-            p.stat().st_size for p in vm_dir.glob(d.with_suffix("").name + "-s*.vmdk")
-        )
-        console.print(f"  {d.name}: {host / 2**30:.1f} GiB")
+        console.print(f"  {d.name}: {host_footprint_bytes(d) / 2**30:.1f} GiB")
 
 
 # --------------------------------------------------------------- compact ----
@@ -132,10 +121,7 @@ def compact(
         None, "--boot", help="Boot-disk VMDK to zerofree+compact alongside"
     ),
     no_zerofree: bool = typer.Option(
-        False, "--no-zerofree", help="Skip booting the helper; plain -k compact only"
-    ),
-    keep_running: bool = typer.Option(
-        False, "--keep-running", help="Leave the helper VM booted afterwards"
+        False, "--no-zerofree", help="Skip the container; plain -k compact only"
     ),
 ) -> None:
     """Reclaim host space WITHOUT touching the filesystem (zerofree + -k compact).
@@ -148,9 +134,8 @@ def compact(
     try:
         compact_disk(
             data,
-            extra_vmdks=(boot,) if boot else (),
+            extra_vmdks=(boot.resolve(),) if boot else (),
             zerofree_fs=not no_zerofree,
-            keep_running=keep_running,
         )
     except Exception as exc:  # noqa: BLE001
         _fail(str(exc))
@@ -164,19 +149,56 @@ def shrink(
     vmdk: Path | None = typer.Option(
         None, "--vmdk", help="Specific data VMDK (default: largest split-sparse)"
     ),
-    keep_running: bool = typer.Option(
-        False, "--keep-running", help="Leave the helper VM booted afterwards"
+    replicas: int = typer.Option(
+        4, "--replicas", min=1, max=8, help="Parallel read-only NBD connections for hashing"
+    ),
+    resume: bool = typer.Option(
+        False, "--resume", help="Reuse an existing baseline manifest (after a crash)"
+    ),
+    mode: str = typer.Option(
+        "nbd",
+        "--mode",
+        help="fs-work transport: nbd = in-place via container qemu-nbd (1x); "
+        "sidecar = disposable Debian VM with the disk attached (1x, no 9p)",
     ),
 ) -> None:
     """Full lossless shrink: fs + partition + VMDK capacity, with hash verification."""
     from .shrink import shrink as run_shrink
 
+    if mode not in ("nbd", "sidecar"):
+        _fail(f"unknown mode {mode!r} (expected nbd or sidecar)")
     try:
-        code = run_shrink(vm_dir.resolve(), target_gib, data_vmdk=vmdk, keep_running=keep_running)
+        code = run_shrink(
+            vm_dir.resolve(),
+            target_gib,
+            data_vmdk=vmdk,
+            replicas=replicas,
+            resume=resume,
+            mode=mode,
+        )
     except Exception as exc:  # noqa: BLE001
         _fail(str(exc))
     if code != 0:
         raise typer.Exit(code=code)
+
+
+# --------------------------------------------------------------- sidecar ----
+sidecar_app = typer.Typer(help="Sidecar VM maintenance.", no_args_is_help=True)
+app.add_typer(sidecar_app, name="sidecar")
+
+
+@sidecar_app.command("teardown")
+def sidecar_teardown(
+    vm_dir: Path = typer.Argument(..., exists=True, file_okay=False),
+) -> None:
+    """Delete the sidecar working directory (cache, keys, seed, VMX, state)."""
+    import shutil
+
+    target = vm_dir.resolve() / ".sidecar"
+    if not target.is_dir():
+        _fail(f"no sidecar directory at {target}")
+    shutil.rmtree(target)
+    ok(f"removed {target}")
 
 
 def _default_data_vmdk(vm_dir: Path) -> Path:

@@ -67,11 +67,25 @@ class DiskStats:
 
 
 def _iter_extent_files(descriptor: Path) -> list[Path]:
-    base = descriptor.with_name(descriptor.stem)  # strips .vmdk, keeps prefix
-    files = sorted(descriptor.parent.glob(base.name + "-s*.vmdk"))
-    if not files:
-        raise VmdkFormatError(f"no extent files found for {descriptor}")
+    """Extent files named in the descriptor (any filename convention works).
+
+    Older builds globbed by the ``<stem>-s*.vmdk`` convention, which silently
+    missed disks whose extents carry non-standard names (e.g. produced by
+    qemu-img). The descriptor's RW lines are the source of truth.
+    """
+    files = [descriptor.parent / name for _, name in extent_list(descriptor)]
+    missing = [p for p in files if not p.is_file()]
+    if missing:
+        raise VmdkFormatError(
+            f"missing extent files for {descriptor}: {', '.join(p.name for p in missing[:4])}"
+        )
     return files
+
+
+def host_footprint_bytes(descriptor: Path) -> int:
+    """Host bytes of a descriptor plus every extent file it names."""
+    files = [descriptor, *_iter_extent_files(descriptor)]
+    return sum(p.stat().st_size for p in files if p.is_file())
 
 
 def _parse_extent_header(path: Path) -> ExtentHeader:
@@ -217,6 +231,41 @@ def grain_stats(descriptor: Path) -> DiskStats:
         allocated_bytes=total_allocated,
         extent_count=len(_iter_extent_files(Path(descriptor))),
     )
+
+
+def extent_allocations(descriptor: Path) -> list[int]:
+    """Per-extent allocated (non-zero-grain) bytes, in descriptor order.
+
+    Used to predict the host-space spike of ``resize2fs``: blocks beyond the
+    new filesystem end are relocated into free space *before* it, which in a
+    trimmed sparse disk means freshly allocated grains.
+    """
+    out: list[int] = []
+    for path in _iter_extent_files(Path(descriptor)):
+        hdr = _parse_extent_header(path)
+        with path.open("rb") as f:
+            f.seek(hdr.gd_offset * SECTOR)
+            gd = struct.unpack(f"<{hdr.gd_entries}I", f.read(hdr.gd_entries * 4))
+            allocated = 0
+            remaining = hdr.grains
+            for gt_sector in gd:
+                if remaining <= 0:
+                    break
+                if gt_sector == 0:
+                    remaining -= hdr.gt_entries_per_table
+                    continue
+                f.seek(gt_sector * SECTOR)
+                gtv = struct.unpack(
+                    f"<{hdr.gt_entries_per_table}I",
+                    f.read(hdr.gt_entries_per_table * 4),
+                )
+                for g in gtv[: max(0, remaining)]:
+                    a = g & 0x7FFFFFFF
+                    if not (g & 0x80000000) and a != 0:
+                        allocated += 1
+                remaining -= hdr.gt_entries_per_table
+        out.append(allocated * hdr.grain_bytes)
+    return out
 
 
 def extent_list(descriptor: Path) -> list[tuple[int, str]]:

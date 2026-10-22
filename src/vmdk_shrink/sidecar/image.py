@@ -156,15 +156,10 @@ def _force_nocloud(
         "mkdir -p /work/.seed\n"
         "mount -o rw /dev/nbd1p1 /mnt2\n"
         "printf 'datasource_list: [ NoCloud ]\\n' > "
-        "/mnt2/etc/cloud/cloud.cfg.d/99-force-nocloud.cfg\n"
-        + copy_seed
-        + "umount /mnt2\n"
+        "/mnt2/etc/cloud/cloud.cfg.d/99-force-nocloud.cfg\n" + copy_seed + "umount /mnt2\n"
         "qemu-nbd -d /dev/nbd1\n"
     )
     result = ex.run(script, timeout=900, check=False)
     if result.exit_code != 0:
         raise ImageError(f"NoCloud pinning failed: {result.output[-500:]}")
     ok("datasource pinned: NoCloud")
-
-
-

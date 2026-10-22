@@ -1,8 +1,9 @@
 """``vmdk compact``: reclaim host space WITHOUT touching the guest filesystem.
 
-zerofree zeroes free blocks (inside the unchanged filesystem), then
-``vmware-vdiskmanager -k`` deallocates the now-zero grains. Capacity is never
-reduced — a running guest can expand the disk again on demand.
+zerofree zeroes free blocks that still hold stale data (it skips blocks that
+are already zero, so host files never balloon), then ``vmware-vdiskmanager -k``
+deallocates the now-zero grains.
+Capacity is never reduced — a running guest can expand the disk again on demand.
 """
 
 from __future__ import annotations
@@ -10,11 +11,15 @@ from __future__ import annotations
 from pathlib import Path
 
 from .console import err, info, ok, step
-from .fsops import activate_lvm, check_fs, ext4_devices, fs_facts, zerofree
+from .fsops import activate_lvm, check_fs, ext4_devices, fs_facts, nbd_written, zerofree
+from .nbd import NbdDisk
 from .paths import DEFAULT_PATHS, HostPaths
+from .progress import PhaseBar
+from .reclaim import FreeMap, collect_free_map, describe, trim_with_map
 from .session import attach_rw, open_session
+from .sidecar.orchestrator import RealVmrun, SidecarError
 from .vdiskmanager import VDiskManager
-from .vmdk_parser import grain_stats
+from .vmdk_parser import VmdkFormatError, extent_list, grain_stats
 
 
 def _du_bytes(paths: list[Path]) -> int:
@@ -22,8 +27,16 @@ def _du_bytes(paths: list[Path]) -> int:
 
 
 def _extent_files(vmdk: Path) -> list[Path]:
-    stem = vmdk.with_suffix("").name
-    return sorted(vmdk.parent.glob(stem + "-s*.vmdk"))
+    """Extent files referenced by the descriptor.
+
+    Never glob the descriptor stem: extents can be renamed (e.g. data-new-
+    sNNN.vmdk after a convert), and a missed extent leaves its allocated
+    blocks unaccounted in the footprint math.
+    """
+    try:
+        return [vmdk.parent / name for _, name in extent_list(vmdk)]
+    except VmdkFormatError:
+        return []  # monolithic/flat: the descriptor file is the whole disk
 
 
 def compact_disk(
@@ -41,6 +54,19 @@ def compact_disk(
     """
     vmdk = Path(vmdk).resolve()
     target_vmdks = (vmdk, *extra_vmdks)
+    vm_dir = vmdk.parent
+    vmrun = RealVmrun(paths)
+    for vmx in sorted(vm_dir.glob("*.vmx")):
+        try:
+            live = vmrun.is_running(vmx)
+        except SidecarError:
+            live = False  # vmrun unusable: vdiskmanager's own lock check decides
+        if live:
+            err(
+                f"{vmx.name} is running — vmware-vdiskmanager cannot compact "
+                "the disks of a live VM; power it off first"
+            )
+            return 1
     step(f"Compact-only mode for [val]{', '.join(v.name for v in target_vmdks)}[/val]")
     step("Filesystem size is NOT touched — capacity stays as-is")
 
@@ -54,6 +80,8 @@ def compact_disk(
     )
 
     if zerofree_fs:
+        bar = PhaseBar()
+        trim_maps: list[tuple[Path, FreeMap]] = []
         with open_session(vmdk.parent, paths=paths) as session:
             ex = session.executor
             for t in target_vmdks:
@@ -63,7 +91,7 @@ def compact_disk(
                     activate_lvm(ex)
                     devices = ext4_devices(ex, under=disk.device)
                     if not devices:
-                        info(f"{t.name}: no ext4 filesystem found — skipping zerofree")
+                        info(f"{t.name}: no ext4 filesystem found — skipping free-space reclaim")
                         continue
                     for dev in devices:
                         facts = fs_facts(ex, dev)
@@ -71,20 +99,40 @@ def compact_disk(
                             f"{t.name} {dev}: ext4 {facts.size_bytes / 2**30:.0f} GiB, "
                             f"{facts.free_blocks * facts.block_size / 2**30:.1f} GiB free"
                         )
-                        # zerofree refuses a dirty fs; replay the journal first
+                        # the free map is only trustworthy on a clean fs
                         step(f"e2fsck -fy on [val]{dev}[/val]")
-                        check_fs(ex, dev, fix=True)
+                        check_fs(ex, dev, fix=True, bar=bar)
+                        if dev == disk.partition(1):
+                            # Grain-table trim: the fs free map drives GTE
+                            # clearing on the closed files — no zero-writes.
+                            # Collected here, applied after the session ends.
+                            trim_maps.append((t, collect_free_map(ex, disk)))
+                            continue
+                        # Stacked volumes (LVM) can't be projected to disk
+                        # sectors: fall back to zero-writing free blocks.
                         step(f"zerofree [val]{dev}[/val]")
-                        output = zerofree(ex, dev)
+
+                        def _sampler(d: NbdDisk = disk) -> int:
+                            return nbd_written(ex, d.device)
+
+                        bar.start_bytes("zerofree", facts.free_blocks * facts.block_size, _sampler)
+                        try:
+                            output = zerofree(ex, dev)
+                        finally:
+                            bar.finish()
                         info(
-                            output.strip().splitlines()[-1]
-                            if output.strip()
-                            else "nothing to zero"
+                            output.strip().splitlines()[-1] if output.strip() else "nothing to zero"
                         )
-                except Exception as exc:  # noqa: BLE001 — best effort per disk
-                    info(f"zerofree skipped for {t.name}: {exc}")
+                except Exception as exc:  # noqa: BLE001 - best effort per disk
+                    info(f"free-space reclaim skipped for {t.name}: {exc}")
                 finally:
                     session.nbd.disconnect()
+        bar.close()
+        for t, free_map in trim_maps:
+            try:
+                info(describe(trim_with_map(t, free_map)))
+            except Exception as exc:  # noqa: BLE001 - never fail a compact at trim
+                info(f"grain-table trim skipped for {t.name}: {exc}")
 
     for t in target_vmdks:
         step(f"vdiskmanager -k on [val]{t.name}[/val]")

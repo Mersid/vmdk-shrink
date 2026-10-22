@@ -8,10 +8,9 @@ import pytest
 
 from vmdk_shrink.container import Container, ContainerError
 from vmdk_shrink.executor import ExecResult
-from vmdk_shrink.fsops import FsFacts, fs_facts, nbd_written, partition_geometry
+from vmdk_shrink.fsops import FsFacts, fs_facts, nbd_written, parse_free_ranges
 from vmdk_shrink.manifest import diff, load, parse_manifest_text
 from vmdk_shrink.nbd import NbdDisk
-from vmdk_shrink.paths import HostPaths
 
 H1 = "a" * 64
 H2 = "b" * 64
@@ -121,6 +120,15 @@ def test_fs_facts_parses_dumpe2fs() -> None:
     assert facts.used_gib == pytest.approx((262135880 - 120000000) * 4096 / 2**30)
 
 
+def test_parse_free_ranges_separates_summary_from_group_lines() -> None:
+    text = (
+        "Free blocks:              454735\n"
+        "  Free blocks: 8615-32767, 33025-33279\n"
+        "  Free blocks: 40000-40000\n"
+    )
+    assert parse_free_ranges(text) == [(8615, 32767), (33025, 33279), (40000, 40000)]
+
+
 def test_nbd_written_reads_write_sectors_not_inflight() -> None:
     # Field layout (0-indexed): 6 = write sectors, 8 = in_flight. The captured
     # stall-scene line from /sys/block/nbd0/stat: in_flight was 0 while 16 GiB
@@ -132,32 +140,3 @@ def test_nbd_written_reads_write_sectors_not_inflight() -> None:
     )
     ex = FakeExec({"stat": line})
     assert nbd_written(ex, "/dev/nbd0") == 33501808
-
-
-def test_partition_geometry_parses_sgdisk() -> None:
-    out = (
-        "Disk /dev/nbd0: 2097152000 sectors, 1000.0 GiB\n"
-        "Number Start (sector)    End (sector)  Size       Code  Name\n"
-        "   1           44944      2097131983   1000.0 GiB  8300  Linux filesystem\n"
-    )
-    ex = FakeExec({"sgdisk -p": out})
-    geo = partition_geometry(ex, "/dev/nbd0")
-    assert geo.start_lba == 44944
-    assert geo.end_lba == 2097131983
-
-
-def test_partition_geometry_missing_raises() -> None:
-    from vmdk_shrink.fsops import FsError
-
-    ex = FakeExec({"sgdisk -p": "Disk /dev/nbd0: 0 sectors\n"})
-    with pytest.raises(FsError):
-        partition_geometry(ex, "/dev/nbd0")
-
-
-# ------------------------------------------------------------- paths ----
-def test_host_paths_requires_vdiskmanager(tmp_path: Path) -> None:
-    paths = HostPaths(workstation_dir=tmp_path)
-    assert paths.require_tools() == [paths.vdiskmanager, paths.vmrun]
-    (tmp_path / "vmware-vdiskmanager.exe").write_text("", encoding="utf-8")
-    (tmp_path / "vmrun.exe").write_text("", encoding="utf-8")
-    assert paths.require_tools() == []

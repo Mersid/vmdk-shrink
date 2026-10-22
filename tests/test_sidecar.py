@@ -24,9 +24,7 @@ class FakeRunner:
         self._scripts = scripts
         self.calls: list[str] = []
 
-    def run(
-        self, command: str, *, timeout: float = 120.0, check: bool = True
-    ) -> ExecResult:
+    def run(self, command: str, *, timeout: float = 120.0, check: bool = True) -> ExecResult:
         self.calls.append(command)
         for needle, response in self._scripts.items():
             if needle in command:
@@ -42,21 +40,19 @@ class TestVmx:
     def test_renders_data_disk_absolute_and_nat(self, tmp_path: Path) -> None:
         boot = tmp_path / "base.vmdk"
         data = Path(r"E:\testvm\data.vmdk")
-        spec = SidecarVmxSpec(
-            boot_disk=boot, data_disk=data, seed_iso=boot.parent / "seed.iso"
-        )
+        spec = SidecarVmxSpec(boot_disk=boot, data_disk=data, seed_iso=boot.parent / "seed.iso")
         text = spec.render()
         assert f'sata0:1.fileName = "{data}"' in text
         assert 'connectionType = "nat"' in text
         assert 'sata0.present = "TRUE"' in text
-        assert 'sata0:0.fileName = ' in text
+        assert "sata0:0.fileName = " in text
         # NAT is the only network; no host-only/bridged surprises
         assert text.count("ethernet0.present") == 1
 
     def test_write_creates_vmx(self, tmp_path: Path) -> None:
-        vmx = SidecarVmxSpec(
-            boot_disk=tmp_path / "b.vmdk", data_disk=tmp_path / "d.vmdk"
-        ).write(tmp_path / "sidecar.vmx")
+        vmx = SidecarVmxSpec(boot_disk=tmp_path / "b.vmdk", data_disk=tmp_path / "d.vmdk").write(
+            tmp_path / "sidecar.vmx"
+        )
         assert vmx.is_file()
         assert "sidecar.vmx" in str(vmx)
 
@@ -120,11 +116,7 @@ class TestGates:
             gates.assert_partition_layout(runner, "/dev/sdb", 44944, 12345)
 
     def test_block_count_gate(self) -> None:
-        runner = FakeRunner(
-            {
-                "dumpe2fs -h": "0|Block count:  188743680\nBlock size:  4096\n"
-            }
-        )
+        runner = FakeRunner({"dumpe2fs -h": "0|Block count:  188743680\nBlock size:  4096\n"})
         gates.assert_block_count(runner, "/dev/sdb1", 188743680, 4096)
         with pytest.raises(gates.GateError, match="did not reach"):
             gates.assert_block_count(runner, "/dev/sdb1", 100, 4096)
@@ -180,7 +172,8 @@ class TestWatchLoop:
     def test_completes_on_exit_marker(self, monkeypatch: pytest.MonkeyPatch) -> None:
         runner = FakeRunner(
             {
-                "nohup": "0|started\n", "cat '/run/x' 2>/dev/null": "0|0\n",
+                "nohup": "0|started\n",
+                "cat '/run/x' 2>/dev/null": "0|0\n",
                 "awk '{print $6}'": "0|1000\n",
             }
         )
@@ -189,7 +182,8 @@ class TestWatchLoop:
     def test_stall_on_frozen_counter(self, monkeypatch: pytest.MonkeyPatch) -> None:
         runner = FakeRunner(
             {
-                "nohup": "0|started\n", "cat '/run/x' 2>/dev/null": "0|\n",
+                "nohup": "0|started\n",
+                "cat '/run/x' 2>/dev/null": "0|\n",
                 "awk '{print $6}'": "0|1000\n",  # never advances
                 "tail -c 500": "0|tail\n",
             }
@@ -200,8 +194,8 @@ class TestWatchLoop:
     def test_unreadable_counter_counts_as_frozen(self, monkeypatch: pytest.MonkeyPatch) -> None:
         class BrokenProbe(FakeRunner):
             def run(
-        self, command: str, *, timeout: float = 120.0, check: bool = True
-    ) -> ExecResult:
+                self, command: str, *, timeout: float = 120.0, check: bool = True
+            ) -> ExecResult:
                 if "awk" in command:
                     return ExecResult(command=command, exit_code=0, output="")
                 return super().run(command, timeout=timeout, check=check)
@@ -222,8 +216,8 @@ class TestWatchLoop:
 
         class AdvancingRunner(FakeRunner):
             def run(
-        self, command: str, *, timeout: float = 120.0, check: bool = True
-    ) -> ExecResult:
+                self, command: str, *, timeout: float = 120.0, check: bool = True
+            ) -> ExecResult:
                 if "awk" in command:
                     calls["n"] += 1
                     return ExecResult(command=command, exit_code=0, output=f"{calls['n']}\n")
@@ -231,7 +225,8 @@ class TestWatchLoop:
 
         runner = AdvancingRunner(
             {
-                "nohup": "0|started\n", "cat '/run/x' 2>/dev/null": "0|\n",
+                "nohup": "0|started\n",
+                "cat '/run/x' 2>/dev/null": "0|\n",
                 "tail -c 500": "0|tail\n",
             }
         )
@@ -252,7 +247,8 @@ class TestWatchLoop:
     def test_nonzero_exit_raises_with_log_tail(self, monkeypatch: pytest.MonkeyPatch) -> None:
         runner = FakeRunner(
             {
-                "nohup": "0|started\n", "cat '/run/x' 2>/dev/null": "0|3\n",
+                "nohup": "0|started\n",
+                "cat '/run/x' 2>/dev/null": "0|3\n",
                 "awk '{print $6}'": "0|1000\n",
                 "tail -c 500": "0|resize2fs: error tail\n",
             }
@@ -281,8 +277,8 @@ def test_transient_poll_failure_does_not_abort(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setattr(orch, "time", clock)
     run_detached_and_watch(
         FlakyProbeRunner(
-                    {"nohup": "0|started\n", "awk '{print $6}'": "0|1000\n", "tail -c 500": "0|t\n"}
-                ),
+            {"nohup": "0|started\n", "awk '{print $6}'": "0|1000\n", "tail -c 500": "0|t\n"}
+        ),
         "resize2fs /dev/sdb1 720G",
         phase="resize2fs",
         device="sdb",
@@ -299,3 +295,69 @@ def test_transient_poll_failure_does_not_abort(monkeypatch: pytest.MonkeyPatch) 
 def test_guest_runner_protocol_satisfied_by_fake() -> None:
     runner: GuestRunner = FakeRunner({})
     assert callable(runner.run)
+
+
+class TestGuestIpFromLeases:
+    """vmnetdhcp lease lookup: fresh beats stale, expiry beats presence.
+
+    Observed 2026-10-21: the lease file is rewritten out of chronological
+    order and expired leases linger, so "last block wins" silently returned
+    a dead IP for a healthy guest.
+    """
+
+    MAC = "00:0c:29:eb:37:e9"
+
+    @staticmethod
+    def _leases(entries: str) -> Path:
+        raise NotImplementedError
+
+    def _write(self, tmp_path: Path, body: str) -> Path:
+        f = tmp_path / "vmnetdhcp.leases"
+        f.write_text(body, encoding="utf-8")
+        return f
+
+    def test_picks_newest_unexpired_lease(self, tmp_path: Path) -> None:
+        from vmdk_shrink.sidecar.discover import guest_ip_from_leases
+
+        f = self._write(
+            tmp_path,
+            "lease 192.168.223.133 {\n"
+            "  starts 3 2020/01/01 00:00:00;\n"
+            f"  hardware ethernet {self.MAC};\n"
+            "}\n"
+            "lease 192.168.223.134 {\n"
+            "  starts 3 2020/01/02 00:00:00;\n"
+            f"  hardware ethernet {self.MAC};\n"
+            "}\n",
+        )
+        assert guest_ip_from_leases(self.MAC, f) == "192.168.223.134"
+
+    def test_expired_lease_is_ignored(self, tmp_path: Path) -> None:
+        from vmdk_shrink.sidecar.discover import guest_ip_from_leases
+
+        f = self._write(
+            tmp_path,
+            "lease 192.168.223.133 {\n"
+            "  starts 3 2020/01/01 00:00:00;\n"
+            "  ends 3 2020/01/01 00:30:00;\n"
+            f"  hardware ethernet {self.MAC};\n"
+            "}\n",
+        )
+        assert guest_ip_from_leases(self.MAC, f) is None
+
+    def test_other_mac_is_not_returned(self, tmp_path: Path) -> None:
+        from vmdk_shrink.sidecar.discover import guest_ip_from_leases
+
+        f = self._write(
+            tmp_path,
+            "lease 192.168.223.140 {\n"
+            "  starts 3 2020/01/02 00:00:00;\n"
+            "  hardware ethernet 00:0c:29:11:22:33;\n"
+            "}\n",
+        )
+        assert guest_ip_from_leases(self.MAC, f) is None
+
+    def test_missing_file_returns_none(self, tmp_path: Path) -> None:
+        from vmdk_shrink.sidecar.discover import guest_ip_from_leases
+
+        assert guest_ip_from_leases(self.MAC, tmp_path / "nope") is None

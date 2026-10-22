@@ -84,21 +84,18 @@ def user_data(public_key: str) -> str:
         "    ssh_authorized_keys:\n"
         f"      - {public_key}\n"
         "ssh_pwauth: false\n"
-                "disable_root: true\n"
-                "package_update: true\n"
-                "packages:\n"
-                "  - zerofree\n"
-                "  - gdisk\n"
-                "  - parted\n"
+        "disable_root: true\n"
+        "package_update: true\n"
+        "packages:\n"
+        "  - zerofree\n"
+        "  - gdisk\n"
+        "  - parted\n"
         'final_message: "vmdk-shrink sidecar ready after $UPTIME seconds"\n'
     )
 
 
 def meta_data(instance_id: str = "vmdk-shrink-sidecar") -> str:
-    return (
-        f"instance-id: {instance_id}\n"
-        "local-hostname: vmdk-shrink-sidecar\n"
-    )
+    return f"instance-id: {instance_id}\nlocal-hostname: vmdk-shrink-sidecar\n"
 
 
 def network_config(mac: str) -> str:
@@ -139,8 +136,7 @@ def build_seed_iso(
     if guest_mac:
         nc.write_text(network_config(guest_mac), encoding="utf-8")
         files = (
-            f"{container_seed}/user-data {container_seed}/meta-data "
-            f"{container_seed}/network-config"
+            f"{container_seed}/user-data {container_seed}/meta-data {container_seed}/network-config"
         )
     else:
         files = f"{container_seed}/user-data {container_seed}/meta-data"

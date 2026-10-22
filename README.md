@@ -11,11 +11,20 @@ brought down to (data + headroom) with **zero data loss**, verified by hashing
 every file before and after. Two modes:
 
 - **`vmdk shrink`** — full pipeline: hash baseline → `e2fsck` → `resize2fs` to a
-  smaller size → partition shrink (at the original start LBA) → `zerofree` →
-  VMDK compact → descriptor rebuild (orphan extents deleted) → re-hash → diff.
-- **`vmdk compact`** — host-space reclaim only: `zerofree` free blocks inside
-  the untouched filesystem, then `vmware-vdiskmanager -k`. Capacity is not
-  reduced; the guest can grow again on demand. No partition/fs changes at all.
+  smaller size → partition shrink (at the original start LBA) → grain-table
+  trim → VMDK compact → descriptor rebuild (orphan extents deleted) → re-hash
+  → diff.
+- **`vmdk compact`** — host-space reclaim only: grain-table trim of the free
+  blocks inside the untouched filesystem, then `vmware-vdiskmanager -k`.
+  Capacity is not reduced; the guest can grow again on demand. No partition/fs
+  changes at all.
+
+Free-space reclamation is **metadata-only** (`graintrim.py`): the fs free map
+(`dumpe2fs` — the same authority `fstrim` consults) drives grain-table entry
+clearing on the closed extent files. No zero-writes touch the drive, and
+wholly-free grains cost 4 bytes of table-write each. Grains only partially
+free are never touched (live data shares them). qemu's VMDK driver cannot do
+this for us: it silently drops TRIM and materializes WRITE_ZEROES (measured).
 
 ## How it works
 
@@ -25,7 +34,7 @@ perform the filesystem work (`--mode` on `shrink`):
 - **`--mode sidecar`** (recommended; validated end-to-end on an 8 GiB test disk): the data VMDK is
   *attached* to a disposable Debian cloud-image VM (downloaded once, cached,
   SHA-512 verified; cloud-init NoCloud seed provides an ephemeral SSH key).
-  resize2fs/sgdisk/zerofree run in that VM over SSH on VMware's native block
+  resize2fs/sgdisk run in that VM over SSH on VMware's native block
   stack — full array speed, no 9p, and the **1x** footprint (the disk is
   never copied). See `docs/transport-design.md`.
 - **`--mode nbd`** (legacy): qemu-nbd exposes the VMDK in place inside the
@@ -80,8 +89,9 @@ uv run vmdk image rm
 
 ## Safety model
 
-- The filesystem is only modified by `e2fsck` / `resize2fs` / `zerofree` inside
-  the container, and only after the baseline hash completes.
+- The filesystem is only modified by `e2fsck` / `resize2fs` inside the
+  container, and only after the baseline hash completes. Free-space reclaim
+  is metadata-only (grain-table trimming) on the closed files.
 - The host-side steps (`-k` compact, descriptor rewrite) only ever drop
   *unreferenced or all-zero* regions; the descriptor rewrite keeps a `.bak-desc`.
 - A coverage guard fails the run if the parallel hash ever misses a file.

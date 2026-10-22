@@ -63,25 +63,26 @@ def identify_data_disk(
     a size that does not (or vice versa) is a hard stop: wrong-disk ambiguity
     is fatal, never "probably fine".
     """
-    result = runner.run(
-        f"readlink -f /dev/disk/by-uuid/{expected_uuid}", timeout=30, check=False
-    )
+    result = runner.run(f"readlink -f /dev/disk/by-uuid/{expected_uuid}", timeout=30, check=False)
     devices = [ln.strip() for ln in result.output.splitlines() if ln.strip()]
     if len(devices) != 1:
         raise GateError(
             f"expected exactly one device with UUID {expected_uuid}, found {devices or 'none'}"
         )
     device = devices[0]
-    size = int(
-        _single_line(
-            runner.run(
-                f"cat /sys/class/block/{Path(device).name}/size 2>/dev/null "
-                f"|| lsblk -b -d -n -o SIZE '{device}'",
-                timeout=30,
-            ).output
+    size = (
+        int(
+            _single_line(
+                runner.run(
+                    f"cat /sys/class/block/{Path(device).name}/size 2>/dev/null "
+                    f"|| lsblk -b -d -n -o SIZE '{device}'",
+                    timeout=30,
+                ).output
+            )
+            or "0"
         )
-        or "0"
-    ) * 512
+        * 512
+    )
     if size != expected_partition_bytes:
         raise GateError(
             f"data partition {device} is {size} bytes, expected {expected_partition_bytes} "
@@ -127,8 +128,7 @@ def assert_partition_layout(runner: GuestRunner, device: str, start_lba: int, en
             got_start, got_end = int(fields[1]), int(fields[2])
             if (got_start, got_end) != (start_lba, end_lba):
                 raise GateError(
-                    f"partition 1 is [{got_start}, {got_end}], expected "
-                    f"[{start_lba}, {end_lba}]"
+                    f"partition 1 is [{got_start}, {got_end}], expected [{start_lba}, {end_lba}]"
                 )
             return
     raise GateError(f"partition 1 not found in sgdisk output for {device}")

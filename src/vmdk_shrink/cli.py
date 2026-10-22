@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import sys
 from pathlib import Path
 
 import typer
@@ -161,12 +163,21 @@ def shrink(
         help="fs-work transport: nbd = in-place via container qemu-nbd (1x); "
         "sidecar = disposable Debian VM with the disk attached (1x, no 9p)",
     ),
+    hash_via: str = typer.Option(
+        "sidecar",
+        "--hash-via",
+        help="verification-hash transport: sidecar = in-VM find+sha256sum "
+        "(native disk stack, recommended); container = legacy parallel RO "
+        "qemu-nbd replicas over the 9p bind mount (slow, kept for benchmarking)",
+    ),
 ) -> None:
     """Full lossless shrink: fs + partition + VMDK capacity, with hash verification."""
     from .shrink import shrink as run_shrink
 
     if mode not in ("nbd", "sidecar"):
         _fail(f"unknown mode {mode!r} (expected nbd or sidecar)")
+    if hash_via not in ("sidecar", "container"):
+        _fail(f"unknown hash-via {hash_via!r} (expected sidecar or container)")
     try:
         code = run_shrink(
             vm_dir.resolve(),
@@ -175,11 +186,61 @@ def shrink(
             replicas=replicas,
             resume=resume,
             mode=mode,
+            hash_via=hash_via,
         )
     except Exception as exc:  # noqa: BLE001
         _fail(str(exc))
     if code != 0:
         raise typer.Exit(code=code)
+
+
+# ------------------------------------------------------------------- hash ----
+@app.command()
+def hash(  # noqa: A001 - CLI subcommand name
+    vm_dir: Path = typer.Argument(..., exists=True, file_okay=False),
+    vmdk: Path | None = typer.Option(
+        None, "--vmdk", help="Specific data VMDK (default: largest split-sparse)"
+    ),
+    out: Path | None = typer.Option(
+        None, "--out", help="Manifest output path (default: <vm_dir>/manifest)"
+    ),
+    via: str = typer.Option(
+        "sidecar",
+        "--via",
+        help="transport: sidecar = in-VM find+sha256sum (native disk stack); "
+        "container = legacy RO qemu-nbd replicas over 9p (slow, benchmarking)",
+    ),
+    replicas: int = typer.Option(
+        4, "--replicas", min=1, max=8, help="Container-mode RO NBD replicas"
+    ),
+) -> None:
+    """Hash every file of the data disk to a manifest (verification primitive)."""
+    from .manifest import collect  # noqa: F401 - re-export sanity
+    from .progress import PhaseBar
+
+    if via not in ("sidecar", "container"):
+        _fail(f"unknown via {via!r} (expected sidecar or container)")
+    data = vmdk or _default_data_vmdk(vm_dir)
+    out_path = out or (vm_dir.resolve() / "manifest")
+    bar = PhaseBar()
+    try:
+        if via == "sidecar":
+            from .sidecar.hashing import hash_via_sidecar
+
+            manifest = hash_via_sidecar(vm_dir.resolve(), data, out_path=out_path, bar=bar)
+        else:
+            from .session import hash_all, open_session
+
+            with open_session(vm_dir.resolve()) as session:
+                manifest = hash_all(
+                    session, data, out_path=out_path, replicas=replicas, bar=bar
+                )
+    except Exception as exc:  # noqa: BLE001
+        _fail(str(exc))
+        return
+    finally:
+        bar.close()
+    ok(f"{len(manifest)} files hashed -> {out_path.with_suffix('.raw')}")
 
 
 # --------------------------------------------------------------- sidecar ----
@@ -214,6 +275,12 @@ def _default_data_vmdk(vm_dir: Path) -> Path:
 
 
 def main() -> None:
+    # Rich glyphs (check/cross marks, box drawing) crash on legacy Windows
+    # consoles whose stream codec is cp1252; force UTF-8 with replacement so
+    # the CLI degrades to '?' instead of dying mid-command.
+    for stream in (sys.stdout, sys.stderr):
+        with contextlib.suppress(AttributeError, OSError, ValueError):
+            stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
     app()
 
 

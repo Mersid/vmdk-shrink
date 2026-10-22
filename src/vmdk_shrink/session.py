@@ -19,6 +19,7 @@ from .executor import Executor
 from .manifest import Manifest
 from .nbd import NbdDisk, NbdSession
 from .paths import DEFAULT_PATHS, HostPaths
+from .progress import PhaseBar
 
 WORK_MOUNT = "/work"
 
@@ -101,6 +102,7 @@ def hash_all(
     out_path: Path,
     replicas: int = 4,
     partition: int = 1,
+    bar: PhaseBar | None = None,
 ) -> Manifest:
     """Hash every file via N read-only NBD replicas of the same VMDK.
 
@@ -128,6 +130,7 @@ def hash_all(
             mount=mounts[0],
             extra_mounts=tuple(mounts[1:]),
             out_path=out_path,
+            bar=bar,
         )
     finally:
         for mount in mounts:

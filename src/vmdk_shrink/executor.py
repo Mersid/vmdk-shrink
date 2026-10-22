@@ -27,6 +27,24 @@ class ExecError(RuntimeError):
     pass
 
 
+class StreamExecutor(Protocol):
+    """Anything that can run a shell command and stream its stdout.
+
+    The minimum surface :func:`~vmdk_shrink.manifest.collect` needs — satisfied
+    by the container and by an SSH-backed guest runner alike.
+    """
+
+    def run(self, command: str, *, timeout: float = 120.0, check: bool = True) -> ExecResult: ...
+
+    def stream(
+        self,
+        command: str,
+        *,
+        timeout: float = 7200.0,
+        chunk_cb: object = None,
+    ) -> ExecResult: ...
+
+
 @runtime_checkable
 class Executor(Protocol):
     """Something that can run a shell command and stream its stdout."""

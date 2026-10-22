@@ -144,8 +144,8 @@ class NbdSession:
         self._c.run(
             "for p in /proc/[0-9]*/cmdline; do "
             "c=$(tr '\\0' ' ' < \"$p\" 2>/dev/null); "
-            "case \"$c\" in *qemu-nbd*'-c " + self.device + "'*) "
-            "d=${p%/cmdline}; kill -9 \"${d#/proc/}\" 2>/dev/null || true;; "
+            'case "$c" in *qemu-nbd*\'-c ' + self.device + "'*) "
+            'd=${p%/cmdline}; kill -9 "${d#/proc/}" 2>/dev/null || true;; '
             "esac; done",
             timeout=30,
             check=False,

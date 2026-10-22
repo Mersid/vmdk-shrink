@@ -14,7 +14,8 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .executor import ExecError, Executor
+from .executor import ExecError, StreamExecutor
+from .progress import PhaseBar
 
 MOUNT = "/mnt/data"
 _HASH_LINE = re.compile(r"^([0-9a-f]{64})\s+\*?(.+)$")
@@ -71,11 +72,12 @@ def parse_manifest_text(text: str, *, strip_prefix: str | None = None) -> Manife
 
 
 def collect(
-    ex: Executor,
+    ex: StreamExecutor,
     *,
     mount: str = MOUNT,
     out_path: Path,
     extra_mounts: tuple[str, ...] = (),
+    bar: PhaseBar | None = None,
 ) -> Manifest:
     """Hash every regular file under ``mount`` (plus RO replicas), stream to host.
 
@@ -104,16 +106,27 @@ def collect(
     count = ex.run(f"find {mount} -xdev -type f | wc -l", timeout=3600).output.strip()
     expected = int(count) if count.isdigit() else -1
 
+    if bar is not None and expected >= 0:
+        bar.start_files("hashing", expected)
+
+    def _on_chunk(chunk: str) -> object:
+        sink.write(chunk)
+        done = chunk.count("\n")
+        if done and bar is not None:
+            bar.bump_files(done)
+        return None
+
     with raw_file.open("w", encoding="utf-8", newline="\n") as sink:
-        result = ex.stream(cmd, timeout=14400, chunk_cb=sink.write)
+        result = ex.stream(cmd, timeout=14400, chunk_cb=_on_chunk)
         if result.exit_code != 0:
             raise ExecError(f"hashing failed rc={result.exit_code}")
+    if bar is not None:
+        bar.finish()
 
     manifest = parse_manifest_text(raw_file.read_text(encoding="utf-8", errors="replace"))
     if expected >= 0 and len(manifest) != expected:
         raise ExecError(
-            f"manifest coverage mismatch: hashed {len(manifest)} files, "
-            f"filesystem has {expected}"
+            f"manifest coverage mismatch: hashed {len(manifest)} files, filesystem has {expected}"
         )
     return manifest
 

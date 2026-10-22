@@ -73,7 +73,7 @@ class VDiskManager:
         last_pct = -1
         rc_holder: list[int] = []
 
-        def _pump(progress: Progress, task: TaskID) -> None:
+        def _pump(prog: Progress, tid: TaskID) -> None:
             nonlocal last_pct
             buf = ""
             while True:
@@ -89,7 +89,7 @@ class VDiskManager:
                             pct = int(digits.split()[0])
                             if pct != last_pct and pct <= 100:
                                 last_pct = pct
-                                progress.update(task, completed=pct)
+                                prog.update(tid, completed=pct)
                     buf = ""
 
         # Rich Progress drives the in-place redraw: a raw CR inside
@@ -112,7 +112,11 @@ class VDiskManager:
             t.start()
             rc_holder.append(proc.wait())
             t.join(timeout=5)
-            progress.update(task, completed=max(last_pct, 0))
+            # The tool's Shrink: counter stalls below 100 long before exit
+            # (the table/header-rewrite tail emits nothing), so a completed
+            # compact must snap the bar to 100 - a frozen 36% reads as a
+            # truncated run.
+            progress.update(task, completed=100 if rc_holder[0] == 0 else max(last_pct, 0))
         rc = rc_holder[0]
         if rc != 0:
             raise VDiskManagerError(f"compact of {vmdk} failed rc={rc}")

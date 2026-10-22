@@ -9,11 +9,13 @@ DHCP-configured guest within one sweep (~seconds, parallel).
 
 from __future__ import annotations
 
+import contextlib
 import ipaddress
 import re
 import subprocess
 import time
 from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
 
 from ..console import info, step
@@ -24,9 +26,7 @@ class IpDiscoveryError(RuntimeError):
     pass
 
 
-_MAC_LINE = re.compile(
-    r"(?P<ip>\d+\.\d+\.\d+\.\d+)\s+(?P<mac>[0-9a-fA-F-]{17})", re.IGNORECASE
-)
+_MAC_LINE = re.compile(r"(?P<ip>\d+\.\d+\.\d+\.\d+)\s+(?P<mac>[0-9a-fA-F-]{17})", re.IGNORECASE)
 
 
 def guest_mac_from_vmx(vmx: Path) -> str:
@@ -54,18 +54,70 @@ def _arp_table() -> dict[str, str]:
 
 
 def _ping_sweep(subnet: str, timeout_ms: int = 400) -> None:
-    """Ping the subnet's .1..254 concurrently-ish (fast fire-and-forget)."""
+    """Ping the subnet's .1..254 (best effort, fire-and-forget).
+
+    ``cmd /c`` accepts ~8191 characters; one giant &-joined line silently
+    dies with "input line too long" and never sends a single ping, so the
+    sweep is chunked well under the limit.
+    """
     network = ipaddress.IPv4Network(subnet)
     hosts = [str(h) for h in network.hosts()]
-    # Windows ping: cheap, one per address; sequential with a tight timeout is
-    # too slow for 254 hosts, so spawn in chunks via start //B.
-    chunk = " & ".join(f"ping -n 1 -w {timeout_ms} {ip} >nul 2>&1" for ip in hosts)
-    subprocess.run(  # noqa: S603 - fixed argv, no user input
-        ["cmd", "/c", chunk],
-        capture_output=True,
-        timeout=max(30, timeout_ms * len(hosts) // 1000 + 30),
-        check=False,
+    per_cmd = 40
+    for i in range(0, len(hosts), per_cmd):
+        chunk = " & ".join(
+            f"ping -n 1 -w {timeout_ms} {ip} >nul 2>&1" for ip in hosts[i : i + per_cmd]
+        )
+        with contextlib.suppress(OSError, subprocess.SubprocessError):
+            # sweep is best-effort; lease lookup carries discovery
+            subprocess.run(  # noqa: S603 - fixed argv, no user input
+                ["cmd", "/c", chunk],
+                capture_output=True,
+                timeout=max(30, timeout_ms * per_cmd // 1000 + 15),
+                check=False,
+            )
+
+
+LEASES = Path(r"C:\ProgramData\VMware\vmnetdhcp.leases")
+
+
+def guest_ip_from_leases(mac: str, leases: Path = LEASES) -> str | None:
+    """Authoritative MAC -> IP from vmnetdhcp's lease database.
+
+    The ARP sweep cannot see a quiet guest: Windows only caches ARP entries
+    for hosts it has talked to, and a freshly booted cloud image may stay
+    silent long enough to starve every sweep (observed 2026-10-21: a healthy
+    guest with a live DHCP lease never appeared in the cache). The lease file
+    answers the question directly.
+
+    Two traps, both hit in testing: the file is rewritten out of
+    chronological order (a stale lease can sit after a fresh one), and old
+    leases linger after expiry. So: drop expired leases, then take the one
+    with the newest ``starts`` timestamp.
+    """
+    if not leases.is_file():
+        return None
+    text = leases.read_text(encoding="utf-8", errors="replace")
+    now = datetime.now(UTC).strftime("%Y/%m/%d %H:%M:%S")
+    best_start, best_ip = "", None
+    for match in re.finditer(r"lease\s+(\d+\.\d+\.\d+\.\d+)\s*\{([^}]*)\}", text):
+        ip, body = match.group(1), match.group(2)
+        if mac.lower() not in body.lower():
+            continue
+        starts = _lease_time(body, "starts")
+        ends = _lease_time(body, "ends")
+        if ends and ends < now:
+            continue  # expired lease from a previous boot
+        if starts and starts >= best_start:
+            best_start, best_ip = starts, ip
+    return best_ip
+
+
+def _lease_time(body: str, key: str) -> str:
+    """``key`` timestamp from a lease body, normalized for lexical compare."""
+    match = re.search(
+        rf"{key}\s+(?:\d+\s+)?(\d{{4}}/\d{{2}}/\d{{2}} \d{{2}}:\d{{2}}:\d{{2}})", body
     )
+    return match.group(1) if match else ""
 
 
 def guest_mac_from_log(vmx: Path) -> str:
@@ -93,6 +145,10 @@ def wait_for_guest_ip(
         sleep = time.sleep
     mac = guest_mac_from_log(vmx)
     for attempt in range(1, attempts + 1):
+        leased = guest_ip_from_leases(mac)
+        if leased:
+            info(f"guest discovered at [val]{leased}[/val] (DHCP lease, MAC {mac})")
+            return leased
         table = _arp_table()
         if mac in table:
             ip = table[mac]
@@ -117,8 +173,6 @@ def vmnet8_subnet() -> str:
             current_adapter = line
         match = re.search(r"IPv4.*?:\s*(\d+\.\d+\.\d+\.\d+)", line)
         if match and "VMnet8" in current_adapter:
-            network = ipaddress.IPv4Network(
-                match.group(1) + "/24", strict=False
-            )
+            network = ipaddress.IPv4Network(match.group(1) + "/24", strict=False)
             return str(network)
     raise ExecError("VMnet8 adapter not found; NAT networking required for sidecar mode")

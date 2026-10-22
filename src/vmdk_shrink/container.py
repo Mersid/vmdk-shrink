@@ -9,6 +9,7 @@ removes every trace.
 
 from __future__ import annotations
 
+import os
 import subprocess
 import time
 from pathlib import Path
@@ -19,7 +20,7 @@ from .paths import DEFAULT_PATHS, HostPaths
 
 IMAGE_NAME = "vmdk-shrink"
 IMAGE_TAG = f"{IMAGE_NAME}:latest"
-CONTAINER_NAME = "vmdk-shrink"
+CONTAINER_PREFIX = IMAGE_NAME
 WORK_MOUNT = "/work"
 
 
@@ -36,11 +37,13 @@ class Container:
         *,
         paths: HostPaths = DEFAULT_PATHS,
         image: str = IMAGE_TAG,
-        name: str = CONTAINER_NAME,
+        name: str | None = None,
     ) -> None:
         self._paths = paths
         self._image = image
-        self._name = name
+        # One session per process: a fixed name would let a second concurrent
+        # pipeline tear down the first one's container as "stale".
+        self._name = name or f"{CONTAINER_PREFIX}-{os.getpid()}"
         self._mounts = mounts
         self._running = False
 
@@ -73,6 +76,7 @@ class Container:
     # --------------------------------------------------------- lifecycle ----
     def start(self) -> None:
         self._ensure_nbd_module()
+        self._refuse_concurrent()
         self._remove_stale()
         args = ["run", "-d", "--name", self._name, "--privileged", "--init"]
         for host, cont in self._mounts:
@@ -196,11 +200,39 @@ class Container:
                 stderr=f"docker command timed out after {timeout:.0f}s",
             )
 
+    def _refuse_concurrent(self) -> None:
+        """Abort if another live session exists: two pipelines on one nbd0 is chaos."""
+        proc = self._docker(
+            "ps", "--filter", f"name=^/{CONTAINER_PREFIX}", "--format", "{{.Names}}"
+        )
+        live = [n for n in (proc.stdout or "").split() if n and n != self._name]
+        if live:
+            raise ContainerError(
+                f"another pipeline is already running (container {live[0]!r}); "
+                "only one vmdk-shrink session can run at a time"
+            )
+
     def _remove_stale(self) -> None:
-        proc = self._docker("ps", "-a", "--filter", f"name=^/{self._name}$", "--format", "{{.ID}}")
-        if proc.returncode == 0 and proc.stdout.strip():
-            warn(f"removing stale container [val]{self._name}[/val]")
-            self._docker("rm", "-f", self._name)
+        """Sweep dead sessions from earlier crashed runs (never live ones)."""
+        proc = self._docker(
+            "ps",
+            "-a",
+            "--filter",
+            f"name=^/{CONTAINER_PREFIX}",
+            "--filter",
+            "status=created",
+            "--filter",
+            "status=exited",
+            "--filter",
+            "status=dead",
+            "--format",
+            "{{.ID}} {{.Names}}",
+        )
+        for line in (proc.stdout or "").splitlines():
+            cid, _, name = line.partition(" ")
+            if cid:
+                warn(f"removing stale container [val]{name or cid}[/val]")
+                self._docker("rm", "-f", cid)
 
     def _ensure_nbd_module(self) -> None:
         """Load the nbd kernel module into Docker Desktop's WSL2 kernel.

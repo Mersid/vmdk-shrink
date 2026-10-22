@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -26,8 +27,10 @@ class SshError(ExecError):
 class GuestRunner(Protocol):
     """Anything that can run a shell command inside the sidecar guest."""
 
-    def run(
-        self, command: str, *, timeout: float = 120.0, check: bool = True
+    def run(self, command: str, *, timeout: float = 120.0, check: bool = True) -> ExecResult: ...
+
+    def stream(
+        self, command: str, *, timeout: float = 7200.0, chunk_cb: object = None
     ) -> ExecResult: ...
 
 
@@ -56,9 +59,7 @@ class SshRunner:
         self._config = config
         self._binary = require_ssh_client()
 
-    def run(
-        self, command: str, *, timeout: float = 120.0, check: bool = True
-    ) -> ExecResult:
+    def _argv(self, command: str) -> list[str]:
         argv = [self._binary, "-o", "BatchMode=yes", "-o", "LogLevel=ERROR"]
         if self._config.key is not None:
             argv += ["-i", str(self._config.key)]
@@ -78,6 +79,10 @@ class SshRunner:
             "--",
             command,
         ]
+        return argv
+
+    def run(self, command: str, *, timeout: float = 120.0, check: bool = True) -> ExecResult:
+        argv = self._argv(command)
         try:
             proc = subprocess.run(  # noqa: S603 - fixed argv, no user input
                 argv,
@@ -102,3 +107,35 @@ class SshRunner:
                 f"ssh command failed (rc={result.exit_code}): {command[:120]}\n{result.output}"
             )
         return result
+
+    def stream(
+        self, command: str, *, timeout: float = 7200.0, chunk_cb: object = None
+    ) -> ExecResult:
+        """Stream guest stdout line-by-line (Executor.stream contract).
+
+        Same shape as :meth:`vmdk_shrink.container.Container.stream`, so
+        ``manifest.collect`` runs against a guest unchanged.
+        """
+        proc = subprocess.Popen(  # noqa: S603 - fixed argv, no user input
+            self._argv(command),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+        )
+        assert proc.stdout is not None
+        collected: list[str] = []
+        deadline = time.monotonic() + timeout
+        for line in proc.stdout:
+            collected.append(line)
+            if callable(chunk_cb):
+                chunk_cb(line)
+            if time.monotonic() > deadline:
+                proc.kill()
+                raise SshError(f"ssh stream timed out after {timeout:.0f}s: {command[:120]}")
+        proc.wait(timeout=30)
+        return ExecResult(
+            command=command, exit_code=proc.returncode, output="".join(collected)
+        )

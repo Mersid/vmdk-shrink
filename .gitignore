@@ -13,3 +13,6 @@ wheels/
 .sandbox/
 *.raw
 *.vmdk.bak-desc
+
+# IDE
+.idea/

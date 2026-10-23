@@ -10,7 +10,7 @@ from __future__ import annotations
 import re
 import struct
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import BinaryIO
 
 SPARSE_MAGIC = 0x564D444B
@@ -30,6 +30,11 @@ class ExtentHeader:
     grain_sectors: int
     gt_entries_per_table: int
     gd_offset: int  # sector offset of the grain directory
+    flags: int = 0
+    overhead_sectors: int = 0
+    rgd_offset: int = 0
+    descriptor_offset: int = 0
+    descriptor_size: int = 0
 
     @property
     def grain_bytes(self) -> int:
@@ -37,7 +42,7 @@ class ExtentHeader:
 
     @property
     def grains(self) -> int:
-        return self.capacity_sectors * SECTOR // self.grain_bytes
+        return (self.capacity_sectors + self.grain_sectors - 1) // self.grain_sectors
 
     @property
     def gd_entries(self) -> int:
@@ -73,7 +78,7 @@ def _iter_extent_files(descriptor: Path) -> list[Path]:
     missed disks whose extents carry non-standard names (e.g. produced by
     qemu-img). The descriptor's RW lines are the source of truth.
     """
-    files = [descriptor.parent / name for _, name in extent_list(descriptor)]
+    files = [descriptor.parent / name.replace("\\", "/") for _, name in extent_list(descriptor)]
     missing = [p for p in files if not p.is_file()]
     if missing:
         raise VmdkFormatError(
@@ -91,21 +96,139 @@ def host_footprint_bytes(descriptor: Path) -> int:
 def _parse_extent_header(path: Path) -> ExtentHeader:
     with path.open("rb") as f:
         hdr = f.read(512)
-    if len(hdr) < 72:
+    if len(hdr) != 512:
         raise VmdkFormatError(f"{path}: truncated header")
-    magic, _version, _flags = struct.unpack_from("<III", hdr, 0)
+    magic, version, flags = struct.unpack_from("<III", hdr, 0)
     if magic != SPARSE_MAGIC:
         raise VmdkFormatError(f"{path}: bad magic {magic:#x}")
+    if version not in (1, 3) or flags & ~0x7:
+        raise VmdkFormatError(f"{path}: unsupported sparse version/flags")
+    descriptor_offset, descriptor_size = struct.unpack_from("<QQ", hdr, 28)
+    rgd_offset = struct.unpack_from("<Q", hdr, 48)[0]
+    overhead = struct.unpack_from("<Q", hdr, 64)[0]
+    compression = struct.unpack_from("<H", hdr, 77)[0]
+    if bool(flags & 2) != bool(rgd_offset):
+        raise VmdkFormatError(f"{path}: redundant grain-directory flag/offset mismatch")
+    if compression or hdr[72]:
+        raise VmdkFormatError(f"{path}: compressed or unclean sparse extent unsupported")
+    if bool(descriptor_offset) != bool(descriptor_size):
+        raise VmdkFormatError(f"{path}: descriptor reservation offset/size mismatch")
     capacity, grain_sectors = struct.unpack_from("<QQ", hdr, 12)
     gt_per_gd = struct.unpack_from("<I", hdr, 44)[0]
     gd_offset = struct.unpack_from("<Q", hdr, 56)[0]
-    return ExtentHeader(
+    if not capacity or grain_sectors < 8 or grain_sectors & (grain_sectors - 1):
+        raise VmdkFormatError(f"{path}: invalid sparse capacity/grain size")
+    if gt_per_gd != 512:
+        raise VmdkFormatError(f"{path}: unsupported grain-table size {gt_per_gd}")
+    header = ExtentHeader(
         path=path,
         capacity_sectors=capacity,
         grain_sectors=grain_sectors,
         gt_entries_per_table=gt_per_gd,
         gd_offset=gd_offset,
+        flags=flags,
+        overhead_sectors=overhead,
+        rgd_offset=rgd_offset,
+        descriptor_offset=descriptor_offset,
+        descriptor_size=descriptor_size,
     )
+    _validate_sparse_metadata(header)
+    return header
+
+
+def _validate_sparse_metadata(header: ExtentHeader) -> None:
+    """Check all metadata and data pointers before exposing an extent for writes."""
+    size = header.path.stat().st_size
+    metadata_end = header.overhead_sectors * SECTOR
+    gd_size = ((header.gd_entries * 4 + SECTOR - 1) // SECTOR) * SECTOR
+    regions = [(0, SECTOR)]
+    directories: list[tuple[int, ...]] = []
+    gt_size = header.gt_entries_per_table * 4
+    with header.path.open("rb") as f:
+        if header.descriptor_size:
+            start = header.descriptor_offset * SECTOR
+            end = start + header.descriptor_size * SECTOR
+            if not (SECTOR <= start < end <= metadata_end <= size):
+                raise VmdkFormatError(
+                    f"{header.path}: descriptor reservation outside metadata boundaries"
+                )
+            regions.append((start, end))
+            # QEMU reserves an empty descriptor area even in split-sparse extents.
+            # A nonempty embedded descriptor is a different, unsupported layout.
+            f.seek(start)
+            remaining = end - start
+            while remaining:
+                chunk = f.read(min(remaining, 65536))
+                if not chunk or any(chunk):
+                    raise VmdkFormatError(
+                        f"{header.path}: nonempty embedded descriptor unsupported"
+                    )
+                remaining -= len(chunk)
+        offsets = [header.gd_offset]
+        if header.rgd_offset:
+            offsets.append(header.rgd_offset)
+        for offset in offsets:
+            gd_start = offset * SECTOR
+            if not (gd_start >= SECTOR and gd_start + gd_size <= metadata_end <= size):
+                raise VmdkFormatError(f"{header.path}: grain directory outside metadata boundaries")
+            regions.append((gd_start, gd_start + gd_size))
+            f.seek(gd_start)
+            gd = struct.unpack(f"<{header.gd_entries}I", f.read(header.gd_entries * 4))
+            directories.append(gd)
+            for sector in gd:
+                if not sector:
+                    continue
+                start = sector * SECTOR
+                if not (start >= SECTOR and start + gt_size <= metadata_end):
+                    raise VmdkFormatError(f"{header.path}: grain table outside metadata boundaries")
+                regions.append((start, start + gt_size))
+        regions.sort()
+        if any(a[1] > b[0] for a, b in zip(regions, regions[1:], strict=False)):
+            raise VmdkFormatError(f"{header.path}: overlapping sparse metadata")
+        for index, sector in enumerate(directories[0]):
+            redundant = directories[1][index] if header.rgd_offset else 0
+            if header.rgd_offset and bool(sector) != bool(redundant):
+                raise VmdkFormatError(f"{header.path}: inconsistent redundant grain directories")
+            if not sector:
+                continue
+            f.seek(sector * SECTOR)
+            raw = f.read(gt_size)
+            if redundant:
+                f.seek(redundant * SECTOR)
+                if f.read(gt_size) != raw:
+                    raise VmdkFormatError(f"{header.path}: inconsistent redundant grain tables")
+            entries = struct.unpack(f"<{header.gt_entries_per_table}I", raw)
+            for addr in entries:
+                if not addr or (addr == 1 and header.flags & 4):
+                    continue
+                if not (
+                    addr * SECTOR >= metadata_end and (addr + header.grain_sectors) * SECTOR <= size
+                ):
+                    raise VmdkFormatError(f"{header.path}: grain data outside file/data boundaries")
+
+
+def validated_extent_headers(descriptor: Path) -> list[ExtentHeader]:
+    """Preflight the complete disk before any caller mutates an extent."""
+    extents = extent_list(descriptor)
+    paths = _iter_extent_files(descriptor)
+    if any(path.is_symlink() or path.stat().st_nlink != 1 for path in paths):
+        raise VmdkFormatError(f"{descriptor}: linked/shared extent files are unsupported")
+    headers = [_parse_extent_header(path) for path in paths]
+    for (capacity, _), header in zip(extents, headers, strict=True):
+        if capacity != header.capacity_sectors:
+            raise VmdkFormatError(f"{header.path}: descriptor/header capacity mismatch")
+    return headers
+
+
+def validate_writable(descriptor: Path) -> None:
+    """Read-only preflight for a standalone, supported split-sparse disk.
+
+    Raise ``VmdkFormatError`` for unsafe descriptors, unsupported sparse
+    features, inconsistent redundant grain tables, or invalid metadata/data
+    boundaries. Missing/unreadable files may raise ``OSError``. Call before
+    filesystem mutation; the caller must keep the image quiescent afterward.
+    """
+    validated_extent_headers(Path(descriptor))
 
 
 class RawSparseExtent:
@@ -151,10 +274,10 @@ class RawSparseExtent:
             gt = self._read_gt(grain_index // self._h.gt_entries_per_table)
             addr = gt[grain_index % self._h.gt_entries_per_table]
             can_read = min((self._h.grain_bytes - offset_in_grain) // SECTOR, remaining)
-            if addr & 0x80000000 or (addr & ~0x80000000) == 0:
+            if addr == 0 or (addr == 1 and self._h.flags & 4):
                 out.append(b"\x00" * (can_read * SECTOR))
             else:
-                self._f.seek((addr & ~0x80000000) * SECTOR + offset_in_grain)
+                self._f.seek(addr * SECTOR + offset_in_grain)
                 out.append(self._f.read(can_read * SECTOR))
             pos += can_read
             remaining -= can_read
@@ -167,8 +290,7 @@ class RawSplitSparseDisk:
     def __init__(self, descriptor: Path) -> None:
         self.descriptor = Path(descriptor)
         self._extents: list[RawSparseExtent] = []
-        for path in _iter_extent_files(self.descriptor):
-            hdr = _parse_extent_header(path)
+        for hdr in validated_extent_headers(self.descriptor):
             self._extents.append(RawSparseExtent(hdr))
 
     @property
@@ -176,6 +298,8 @@ class RawSplitSparseDisk:
         return sum(e._h.capacity_sectors for e in self._extents)
 
     def read(self, sector: int, count: int) -> bytes:
+        if sector < 0 or count < 0 or sector + count > self.capacity_sectors:
+            raise VmdkFormatError("read outside disk boundaries")
         out: list[bytes] = []
         pos, remaining = sector, count
         for extent in self._extents:
@@ -202,9 +326,8 @@ def grain_stats(descriptor: Path) -> DiskStats:
     """Walk every grain table and count allocated grains (true data footprint)."""
     total_capacity = 0
     total_allocated = 0
-    for path in _iter_extent_files(Path(descriptor)):
-        hdr = _parse_extent_header(path)
-        with path.open("rb") as f:
+    for hdr in validated_extent_headers(Path(descriptor)):
+        with hdr.path.open("rb") as f:
             f.seek(hdr.gd_offset * SECTOR)
             gd = struct.unpack(f"<{hdr.gd_entries}I", f.read(hdr.gd_entries * 4))
             allocated = 0
@@ -220,8 +343,7 @@ def grain_stats(descriptor: Path) -> DiskStats:
                     f"<{hdr.gt_entries_per_table}I", f.read(hdr.gt_entries_per_table * 4)
                 )
                 for g in gtv[: max(0, remaining)]:
-                    a = g & 0x7FFFFFFF
-                    if not (g & 0x80000000) and a != 0:
+                    if g != 0 and not (g == 1 and hdr.flags & 4):
                         allocated += 1
                 remaining -= hdr.gt_entries_per_table
         total_capacity += hdr.capacity_sectors
@@ -241,9 +363,8 @@ def extent_allocations(descriptor: Path) -> list[int]:
     trimmed sparse disk means freshly allocated grains.
     """
     out: list[int] = []
-    for path in _iter_extent_files(Path(descriptor)):
-        hdr = _parse_extent_header(path)
-        with path.open("rb") as f:
+    for hdr in validated_extent_headers(Path(descriptor)):
+        with hdr.path.open("rb") as f:
             f.seek(hdr.gd_offset * SECTOR)
             gd = struct.unpack(f"<{hdr.gd_entries}I", f.read(hdr.gd_entries * 4))
             allocated = 0
@@ -260,8 +381,7 @@ def extent_allocations(descriptor: Path) -> list[int]:
                     f.read(hdr.gt_entries_per_table * 4),
                 )
                 for g in gtv[: max(0, remaining)]:
-                    a = g & 0x7FFFFFFF
-                    if not (g & 0x80000000) and a != 0:
+                    if g != 0 and not (g == 1 and hdr.flags & 4):
                         allocated += 1
                 remaining -= hdr.gt_entries_per_table
         out.append(allocated * hdr.grain_bytes)
@@ -269,6 +389,59 @@ def extent_allocations(descriptor: Path) -> list[int]:
 
 
 def extent_list(descriptor: Path) -> list[tuple[int, str]]:
-    """Parse ``RW <sectors> SPARSE "<name>"`` lines from a descriptor."""
-    text = Path(descriptor).read_bytes().decode("windows-1252", "replace")
-    return [(int(s), n) for s, n in re.findall(r'^RW (\d+) SPARSE "([^"]+)"', text, re.M)]
+    """Parse a standalone split-sparse descriptor, rejecting ambiguous layouts."""
+    descriptor = Path(descriptor)
+    text = descriptor.read_bytes().rstrip(b"\x00").decode("windows-1252", "surrogateescape")
+    if "\x00" in text:
+        raise VmdkFormatError(f"{descriptor}: interior NUL in descriptor")
+    extents: list[tuple[int, str]] = []
+    settings: dict[str, str] = {}
+    paths: set[Path] = set()
+    identities: set[tuple[int, int]] = set()
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        extent = re.fullmatch(r'RW\s+(\d+)\s+SPARSE\s+"([^"\x00]+)"\s*(?:#.*)?', line)
+        if extent:
+            capacity, name = int(extent[1]), extent[2]
+            windows = PureWindowsPath(name)
+            relative = Path(name.replace("\\", "/"))
+            path = (descriptor.parent / relative).resolve()
+            if (
+                capacity <= 0
+                or windows.drive
+                or windows.root
+                or ":" in name
+                or relative.is_absolute()
+                or ".." in relative.parts
+                or not path.is_relative_to(descriptor.parent.resolve())
+                or path == descriptor.resolve()
+                or path in paths
+            ):
+                raise VmdkFormatError(f"{descriptor}: unsafe or duplicate extent path {name!r}")
+            if path.exists():
+                stat = path.stat()
+                identity = (stat.st_dev, stat.st_ino)
+                if identity in identities:
+                    raise VmdkFormatError(f"{descriptor}: aliased extent files")
+                identities.add(identity)
+            paths.add(path)
+            extents.append((capacity, name))
+            continue
+        setting = re.fullmatch(r'([\w.]+)\s*=\s*(?:"([^"\x00]*)"|([^\s#"\x00]+))\s*(?:#.*)?', line)
+        if not setting:
+            raise VmdkFormatError(f"{descriptor}: unsupported descriptor line {line!r}")
+        key, value = setting[1], setting[2] if setting[2] is not None else setting[3]
+        if key in settings:
+            raise VmdkFormatError(f"{descriptor}: duplicate descriptor key {key}")
+        settings[key] = value
+    if (
+        not extents
+        or settings.get("createType") != "twoGbMaxExtentSparse"
+        or settings.get("version") != "1"
+        or settings.get("parentCID", "ffffffff").lower() != "ffffffff"
+        or "parentFileNameHint" in settings
+    ):
+        raise VmdkFormatError(f"{descriptor}: snapshots, parent chains, or unsupported layout")
+    return extents

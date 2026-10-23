@@ -46,6 +46,8 @@ class TestVmx:
         assert 'connectionType = "nat"' in text
         assert 'sata0.present = "TRUE"' in text
         assert "sata0:0.fileName = " in text
+        assert 'ide1:0.present = "TRUE"' in text
+        assert f'ide1:0.fileName = "{boot.parent / "seed.iso"}"' in text
         # NAT is the only network; no host-only/bridged surprises
         assert text.count("ethernet0.present") == 1
 
@@ -107,11 +109,14 @@ class TestGates:
     def test_partition_layout_gate(self) -> None:
         runner = FakeRunner(
             {
+                "blockdev --rereadpt": "0|",
+                "/sys/class/block/sdb1/start": "0|44944\n1509949440\n",
                 "sgdisk -p": "0|Number  Start (sector)    End (sector)\n"
-                "   1           44944      1509994383   720.0 GiB   8300\n"
+                "   1           44944      1509994383   720.0 GiB   8300\n",
             }
         )
         gates.assert_partition_layout(runner, "/dev/sdb", 44944, 1509994383)
+        assert "blockdev --rereadpt" in runner.calls[0]
         with pytest.raises(gates.GateError, match="expected"):
             gates.assert_partition_layout(runner, "/dev/sdb", 44944, 12345)
 

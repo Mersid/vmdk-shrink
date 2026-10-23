@@ -1,98 +1,120 @@
 # vmdk-shrink
 
-Losslessly shrink (or compact) VMware Workstation ext4 VMDKs from a Windows
-host, using a Docker helper container and provable SHA-256 verification of
-every file.
+Inspect, compact, and shrink **offline** VMware split-sparse disks from Windows.
+Shrink supports a clean, single-partition GPT disk with an ext-family filesystem.
+It compares SHA-256 regular-file manifests before and after mutation.
 
-## What it does
+**Make a full, restorable backup first. These operations modify disks in place.**
+Matching file hashes do not establish complete metadata preservation, bootability,
+or crash safety. A descriptor backup is not a disk backup.
 
-A split-sparse `twoGbMaxExtentSparse` VMDK holding an ext4 filesystem can be
-brought down to (data + headroom) with **zero data loss**, verified by hashing
-every file before and after. Two modes:
+## Commands
 
-- **`vmdk shrink`** — full pipeline: hash baseline → `e2fsck` → `resize2fs` to a
-  smaller size → partition shrink (at the original start LBA) → grain-table
-  trim → VMDK compact → descriptor rebuild (orphan extents deleted) → re-hash
-  → diff.
-- **`vmdk compact`** — host-space reclaim only: grain-table trim of the free
-  blocks inside the untouched filesystem, then `vmware-vdiskmanager -k`.
-  Capacity is not reduced; the guest can grow again on demand. No partition/fs
-  changes at all.
-
-Free-space reclamation is **metadata-only** (`graintrim.py`): the fs free map
-(`dumpe2fs` — the same authority `fstrim` consults) drives grain-table entry
-clearing on the closed extent files. No zero-writes touch the drive, and
-wholly-free grains cost 4 bytes of table-write each. Grains only partially
-free are never touched (live data shares them). qemu's VMDK driver cannot do
-this for us: it silently drops TRIM and materializes WRITE_ZEROES (measured).
-
-## How it works
-
-The Linux toolchain runs in a **privileged Docker container**. Two transports
-perform the filesystem work (`--mode` on `shrink`):
-
-- **`--mode sidecar`** (recommended; validated end-to-end on an 8 GiB test disk): the data VMDK is
-  *attached* to a disposable Debian cloud-image VM (downloaded once, cached,
-  SHA-512 verified; cloud-init NoCloud seed provides an ephemeral SSH key).
-  resize2fs/sgdisk run in that VM over SSH on VMware's native block
-  stack — full array speed, no 9p, and the **1x** footprint (the disk is
-  never copied). See `docs/transport-design.md`.
-- **`--mode nbd`** (legacy): qemu-nbd exposes the VMDK in place inside the
-  container; slow (~20 MB/s writes) and sensitive to the Windows vp9fs Tflush
-  bug, but requires nothing but Docker.
-
-Both modes share the same verification contract: baseline SHA-256 manifest
-before, re-hash after, symmetric diff verdict before any host-side metadata
-change. The **VHDX round-trip** (qemu-img → `wsl --mount --vhd --bare` →
-e2fsprogs → qemu-img back) remains a validated manual alternative: 2x space,
-~8 h, zero custom code; see `docs/transport-design.md` for the measured
-comparison.
-
-Nothing is installed on the host beyond the image itself and the vendored
-`qemu-img.exe`. Cleanup is:
-
-```pwsh
-docker rm vmdk-shrink   # (the pipeline removes its own container automatically)
-docker rmi vmdk-shrink:latest
-```
-
-Hashing fans out over several read-only NBD replicas of the same disk (a single
-qemu-nbd connection is latency-bound around 100 MB/s; 4 replicas reach the
-bind-mount ceiling).
-
-## Requirements
-
-- Windows host with **Docker Desktop** (WSL2 backend; the `nbd` kernel module
-  is loaded automatically via `wsl -d docker-desktop`)
-- VMware Workstation's `vmware-vdiskmanager.exe` (for the `-k` compact step)
-- `uv` (project manages its own `.venv`)
-
-## Quick start
-
-```pwsh
+```powershell
 uv sync
+uv run vmdk --help
+uv run vmdk doctor shrink
+uv run vmdk inspect "C:\VMs\example\data.vmdk" --json
 
-# Shrink the data disk to 700 GiB with full verification (image auto-builds):
-uv run vmdk shrink "C:\Virtual Machines\testvm" 700
+# The plan is shown before confirmation. Ambiguous directories require --vmdk.
+uv run vmdk shrink "C:\VMs\example" 700 --vmdk "C:\VMs\example\data.vmdk"
+uv run vmdk compact "C:\VMs\example" --vmdk "C:\VMs\example\data.vmdk"
 
-# Or just reclaim host space without touching the guest fs:
-uv run vmdk compact "C:\Virtual Machines\testvm"
+# No filesystem work or Docker: VMware's compactor only.
+uv run vmdk compact "C:\VMs\example" --compact-only
 
-# Inspect a split-sparse VMDK's allocation without starting anything:
-uv run vmdk inspect "C:\Virtual Machines\testvm\data.vmdk"
+# Explicit native VMware transport (extra prerequisites and first-boot downloads).
+uv run vmdk shrink "C:\VMs\example" 700 --mode sidecar
+uv run vmdk doctor shrink --mode sidecar
 
-# Manage the image explicitly (optional — shrink/compact auto-build it):
-uv run vmdk image build
-uv run vmdk image ls
-uv run vmdk image rm
+uv run vmdk hash "C:\VMs\example" --via container
+uv run vmdk --no-color status "C:\VMs\example"
 ```
 
-## Safety model
+Use `--yes`/`-y` for non-interactive mutation only after verifying your backup.
+Exit codes: `0` success, `1` operational failure/refusal, `2` content differences
+(or CLI argument errors). Errors go to stderr. `inspect` and `doctor` offer `--json`.
+`NO_COLOR` and `--no-color` disable color; redirected output does not redraw a TUI.
 
-- The filesystem is only modified by `e2fsck` / `resize2fs` inside the
-  container, and only after the baseline hash completes. Free-space reclaim
-  is metadata-only (grain-table trimming) on the closed files.
-- The host-side steps (`-k` compact, descriptor rewrite) only ever drop
-  *unreferenced or all-zero* regions; the descriptor rewrite keeps a `.bak-desc`.
-- A coverage guard fails the run if the parallel hash ever misses a file.
-- The run exits 2 (and says so loudly) if any file's hash differs after.
+## Runtime requirements
+
+Python **3.11+** runs the package (`typer` and `rich`). `uv` is the documented
+environment manager, not an intrinsic runtime dependency. Run `doctor` for the
+command and options you intend to use; it checks executables and Docker readiness,
+not guest networking, NBD kernel availability, or crash recovery.
+
+| Operation | Host requirements |
+|---|---|
+| `inspect`, manifest comparison | Python only |
+| `compact --compact-only` | VMware `vmware-vdiskmanager.exe` |
+| Normal `compact`, default `shrink` | Docker Desktop/Linux containers, WSL2/NBD, VMware disk utility |
+| `hash --via container` | Docker Desktop/Linux containers, WSL2/NBD |
+| Sidecar filesystem work or hashing | Above toolchain plus VMware Workstation/`vmrun`, OpenSSH, Windows ACL/network utilities |
+
+**Docker and VMware are not both running by default.** The container provides
+Linux filesystem tools; the VMware *disk utility* performs final format-aware
+compaction without booting a VM. The optional sidecar boots VMware because its
+native storage stack avoids Docker Desktop's slow/problematic Windows file-share
+write path. Sidecar still uses Docker for cloud-image preparation and shrink's
+discovery/post-geometry checks. `--mode sidecar` is not a Docker-free option.
+
+The default filesystem transport is `nbd`, and hashing now follows it
+(`container`). Sidecar mode defaults to sidecar hashing. Mixed transports require
+an explicit `--hash-via`. Retaining the optional path avoids throwing away the
+native-I/O alternative; removing Docker from it needs a separately tested native
+image-preparation and discovery adapter. See [the decision record](docs/architecture.md).
+
+The container installs `e2fsprogs`, `gdisk`, `zerofree`, `qemu-utils`, `lvm2`,
+`parted` (for `partprobe`), `fdisk` (for `sfdisk`), `util-linux`, and `coreutils`.
+GNU `find`, `xargs`, `sort`, Bash and base64 are also required. There is no required
+host `qemu-img.exe`, TCP NBD client, or seed-ISO generator. The `toolchain-v2` tag
+prevents silently reusing an old image missing new prerequisites.
+
+Sidecar setup downloads a SHA-512-checked Debian cloud image over HTTPS. The guest
+needs repository access during cloud-init provisioning, VMware networking, and
+host-to-guest SSH. Its ephemeral keys and image/state files live in `.sidecar`.
+
+## Safety and recovery
+
+1. Refuse locks, snapshot/parent-chain and unsupported image layouts. Disk
+   selection uses descriptor entries, not filename guesses; ambiguous choices fail.
+2. Discover read-only and require a clean filesystem. A dirty disk must be repaired
+   separately from a backup before collecting the baseline; pre-baseline repair
+   would hide changes from verification. Validate GPT metadata before resizing.
+3. Collect a complete, filename-safe manifest. Save an atomic, per-disk checkpoint
+   containing descriptor identity, extent stats, target, transports and manifest digest.
+4. Record mutation before repair/resize. Use durable writes. Preserve partition
+   start, type, GUID, name and attributes; no automatic retry after interruption.
+5. Compare file contents **before host grain/descriptor edits**. If different,
+   stop without final cleanup. Then trim wholly free grains, preserve descriptor
+   metadata while reducing its extent list, repair final GPT geometry, and compact.
+6. Re-hash the final disk. Only matching hashes permit orphan-extent deletion;
+   failed runs preserve evidence and unreferenced extents for manual recovery.
+
+These stages are **not a transaction**. Resize, GPT changes, grain trimming and
+compaction can already have overwritten data when a failure is detected. Retaining
+orphans does not make rollback possible. Keep the VM powered off throughout; the
+tool's operation lock does not prevent another application from starting VMware.
+
+`--resume` only reuses an unchanged, completed baseline **before mutation began**.
+It refuses interrupted surgery, legacy unbound manifests, changed disk stats,
+different targets/transports and modified manifests. Evidence lives under
+`.vmdk-shrink\<disk-key>\<operation-id>`. Preserve it before manual recovery.
+Never remove a stale operation/image/sidecar lock until all workers are confirmed off.
+
+Manifests cover regular-file **contents**, not ownership, ACLs, extended attributes,
+symlinks, hard-link relationships, empty directories, special files, or bootability.
+Normal `compact` may repair filesystem metadata; it preserves *size*, not every
+filesystem byte. `compact --compact-only` avoids filesystem checks/reclamation.
+
+Container sessions are removed automatically after verified detachment. Use
+`vmdk image rm` to remove the toolchain image. `vmdk sidecar teardown <vm-dir>`
+refuses a running helper before deleting its artifacts. Checkpoints are not
+automatically deleted. Implementation status and integration limitations are
+tracked in [the checklist](docs/implementation-checklist.md).
+
+Validation: `uv run pytest`, `uv run ruff check src tests`, and `uv run mypy src`.
+An explicit disposable-disk integration check is available as
+`uv run python tests\smoke_disposable.py`; it creates only its own fresh project
+directory, verifies normal compaction/NBD shrink and unusual filenames, removes
+the fixture on success, and retains it on failure. It does not boot the sidecar.

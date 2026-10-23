@@ -1,10 +1,4 @@
-"""One working session: a privileged container with the VM dir bind-mounted,
-plus an NBD connection exposing the target VMDK as ``/dev/nbd0``.
-
-Replaces the old helper-VM machinery (ISO patching, vmrun, SSH, VNC). The
-container is created on ``open()`` and always removed on ``close()``/context
-exit, so the only host residue is the Docker image (``docker rmi`` removes it).
-"""
+"""Lifecycle of the container transport and its owned NBD attachments."""
 
 from __future__ import annotations
 
@@ -20,6 +14,7 @@ from .manifest import Manifest
 from .nbd import NbdDisk, NbdSession
 from .paths import DEFAULT_PATHS, HostPaths
 from .progress import PhaseBar
+from .safety import require_offline
 
 WORK_MOUNT = "/work"
 
@@ -38,8 +33,10 @@ class Session:
         return self.container.to_container_path(host_path)
 
     def close(self) -> None:
-        self.nbd.disconnect(check=False)
-        self.container.stop(remove=True)
+        try:
+            self.nbd.disconnect()
+        finally:
+            self.container.stop(remove=True)
 
 
 @contextmanager
@@ -79,6 +76,7 @@ def default_dockerfile() -> Path:
 
 def attach_rw(session: Session, vmdk: Path, *, unsafe_cache: bool = False) -> NbdDisk:
     """Connect a VMDK read-write and return its NBD disk handle."""
+    require_offline(vmdk.parent)
     return session.nbd.connect(
         session.container_path(vmdk), read_only=False, unsafe_cache=unsafe_cache
     )
@@ -86,7 +84,7 @@ def attach_rw(session: Session, vmdk: Path, *, unsafe_cache: bool = False) -> Nb
 
 def attach_ro(session: Session, vmdk: Path, *, index: int) -> NbdDisk:
     """Connect an extra read-only replica of a VMDK (for parallel hashing)."""
-    nbd = NbdSession(session.container, index=index)
+    nbd = session.nbd if index == 0 else NbdSession(session.container, index=index)
     return nbd.connect(session.container_path(vmdk), read_only=True)
 
 
@@ -119,10 +117,10 @@ def hash_all(
         for i in range(replicas):
             nbd = NbdSession(session.container, index=i)
             disk = nbd.connect(session.container_path(vmdk), read_only=True)
+            sessions.append(nbd)
             node = disk.partition(partition)
             mount = f"/mnt/data{i}"
             mount_ro(session.container, node, mount)
-            sessions.append(nbd)
             mounts.append(mount)
         info(f"hashing over [val]{replicas}[/val] read-only replicas")
         return collect(
@@ -136,4 +134,4 @@ def hash_all(
         for mount in mounts:
             unmount(session.container, mount)
         for nbd in sessions:
-            nbd.disconnect(check=False)
+            nbd.disconnect()

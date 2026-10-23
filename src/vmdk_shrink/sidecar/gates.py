@@ -120,7 +120,8 @@ def assert_block_count(
 
 
 def assert_partition_layout(runner: GuestRunner, device: str, start_lba: int, end_lba: int) -> None:
-    """After sgdisk, partition 1 must be exactly [start, end]."""
+    """Reread the table and verify both on-disk and kernel partition geometry."""
+    runner.run(f"blockdev --rereadpt '{device}'", timeout=60)
     output = runner.run(f"/usr/sbin/sgdisk -p '{device}'", timeout=60).output
     for line in output.splitlines():
         fields = line.split()
@@ -129,6 +130,22 @@ def assert_partition_layout(runner: GuestRunner, device: str, start_lba: int, en
             if (got_start, got_end) != (start_lba, end_lba):
                 raise GateError(
                     f"partition 1 is [{got_start}, {got_end}], expected [{start_lba}, {end_lba}]"
+                )
+            name = Path(device).name
+            partition = f"{name}{'p' if name[-1].isdigit() else ''}1"
+            output = runner.run(
+                f"cat /sys/class/block/{partition}/start /sys/class/block/{partition}/size",
+                timeout=60,
+            ).output
+            try:
+                kernel_start, kernel_size = map(int, output.split())
+            except ValueError as exc:
+                raise GateError(f"cannot read kernel geometry for {partition}") from exc
+            if (kernel_start, kernel_size) != (start_lba, end_lba - start_lba + 1):
+                raise GateError(
+                    f"kernel partition geometry for {partition} is stale: "
+                    f"[{kernel_start}, {kernel_start + kernel_size - 1}], "
+                    f"expected [{start_lba}, {end_lba}]"
                 )
             return
     raise GateError(f"partition 1 not found in sgdisk output for {device}")

@@ -1,7 +1,7 @@
 [project]
 name = "vmdk-shrink"
 version = "0.2.0"
-description = "Losslessly shrink or compact VMware ext4 VMDKs from a Windows host using a Docker helper container"
+description = "Inspect, compact and shrink offline VMware ext-family disks with file-content verification"
 readme = "README.md"
 authors = [
     { name = "Mersid", email = "mersid_email@yahoo.com" }
@@ -13,7 +13,7 @@ dependencies = [
 ]
 
 [project.scripts]
-vmdk = "vmdk_shrink.cli:app"
+vmdk = "vmdk_shrink.cli:main"
 
 [build-system]
 requires = ["uv_build>=0.11.23,<0.12.0"]

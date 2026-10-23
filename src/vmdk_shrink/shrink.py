@@ -1,12 +1,4 @@
-"""``vmdk shrink``: the full lossless pipeline with hash verification.
-
-Stages: baseline manifest -> fs shrink -> partition shrink (original start LBA)
--> zerofree -> compact + descriptor rebuild -> verify manifest -> diff verdict.
-
-All Linux work happens in the container against ``/dev/nbd0`` (the VMDK exposed
-by qemu-nbd); the host only runs ``vmware-vdiskmanager`` and rewrites the
-descriptor.
-"""
+"""In-place shrink, checked before host edits and again before orphan cleanup."""
 
 from __future__ import annotations
 
@@ -14,7 +6,9 @@ import shutil
 import time
 from pathlib import Path
 
-from .console import console, err, info, ok, step, warn
+from .checkpoints import prepare
+from .console import console, err, info, ok, step
+from .discovery import select_disk
 from .executor import Executor
 from .fsops import (
     StallError,
@@ -30,14 +24,16 @@ from .fsops import (
 )
 from .manifest import Manifest, diff, load
 from .paths import DEFAULT_PATHS, HostPaths
-from .progress import PhaseBar
+from .presentation import compact_with_progress
+from .progress import PhaseBar, managed_bar
 from .reclaim import FreeMap, TrimUnavailable, collect_free_map, describe, trim_with_map
-from .session import Session, attach_rw, hash_all, open_session
+from .safety import offline_operation, require_offline
+from .session import Session, attach_ro, attach_rw, hash_all, open_session
 from .sidecar.gates import probe_fs_uuid
 from .sidecar.orchestrator import run_sidecar_fs_phase
 from .vdiskmanager import VDiskManager
 from .vmdk_descriptor import compute_plan, delete_orphans, rebuild_descriptor
-from .vmdk_parser import extent_allocations, extent_list, grain_stats
+from .vmdk_parser import extent_allocations, extent_list, grain_stats, validate_writable
 
 SECTOR = 512
 _GIB = 2**30
@@ -49,13 +45,11 @@ class ShrinkError(RuntimeError):
 
 
 def _extent_files(vmdk: Path) -> list[Path]:
-    stem = vmdk.with_suffix("").name
-    return sorted(vmdk.parent.glob(stem + "-s*.vmdk"))
+    return [vmdk.parent / name for _, name in extent_list(vmdk)]
 
 
 def _du_bytes(paths: list[Path]) -> int:
     return sum(p.stat().st_size for p in paths if p.is_file())
-
 
 
 def _hash_verification(
@@ -77,11 +71,13 @@ def _hash_verification(
     if via == "sidecar":
         from .sidecar.hashing import hash_via_sidecar
 
-        return hash_via_sidecar(vm_dir, data_vmdk, out_path=out_path, bar=bar)
+        return hash_via_sidecar(vm_dir, data_vmdk, out_path=out_path, paths=session.paths, bar=bar)
 
     return hash_all(session, data_vmdk, out_path=out_path, replicas=replicas, bar=bar)
 
 
+@offline_operation(directory=True)
+@managed_bar
 def shrink(
     vm_dir: Path,
     target_gib: int,
@@ -92,11 +88,12 @@ def shrink(
     paths: HostPaths = DEFAULT_PATHS,
     mode: str = "nbd",
     hash_via: str = "container",
+    _bar: PhaseBar | None = None,
 ) -> int:
     """Run the full pipeline; return process exit code (0 ok, 2 = data differs).
 
-    ``resume`` reuses an existing ``manifest_before.raw`` (e.g. after a crash
-    mid-run) instead of re-hashing — the expensive stage becomes free.
+    Resume only reuses a disk-bound complete baseline before mutation began.
+    Interrupted filesystem surgery always requires manual recovery.
 
     ``mode`` selects the fs-work transport: ``nbd`` operates on the VMDK in
     place through the container's qemu-nbd (1x, vp9fs-sensitive); ``sidecar``
@@ -104,7 +101,15 @@ def shrink(
     same e2fsprogs sequence over SSH (1x, no 9p in the hot path).
     """
     vm_dir = Path(vm_dir).resolve()
-    data_vmdk = data_vmdk or _largest_split_sparse(vm_dir)
+    if mode not in ("nbd", "sidecar") or hash_via not in ("container", "sidecar"):
+        raise ShrinkError("unsupported filesystem or hashing transport")
+    if target_gib < 1:
+        raise ShrinkError("target must be a positive number of GiB")
+    data_vmdk = select_disk(vm_dir, data_vmdk)
+    validate_writable(data_vmdk)
+    checkpoint = prepare(
+        data_vmdk, target_gib=target_gib, mode=mode, hash_via=hash_via, resume=resume
+    )
     step(f"Full shrink of [val]{data_vmdk.name}[/val] to [val]{target_gib} GiB[/val]")
 
     free = shutil.disk_usage(vm_dir).free
@@ -126,27 +131,32 @@ def shrink(
     t0 = time.monotonic()
 
     # -- discovery + baseline manifest (container) --------------------------
-    bar = PhaseBar()
+    assert _bar is not None
+    bar = _bar
     with open_session(vm_dir, paths=paths) as session:
         ex = session.executor
-        disk = attach_rw(session, data_vmdk)
+        disk = attach_ro(session, data_vmdk, index=0)
         part = disk.partition(1)
         assert_shrinkable_layout(ex, disk.device, part)
         facts = fs_facts(ex, part)
         geo = partition_geometry(ex, disk.device)
+        recreate_partition(
+            ex,
+            disk.device,
+            start_lba=geo.start_lba,
+            end_lba=geo.start_lba + target_gib * _GIB // SECTOR - 1,
+            validate_only=True,
+        )
         info(
             f"partition starts at LBA {geo.start_lba}; "
             f"ext4 {facts.size_bytes / 2**30:.0f} GiB, {facts.used_gib:.1f} GiB in use"
         )
-        # replay the journal now (RW) so later read-only mounts are accepted;
-        # a dirty ext4 refuses RO mounts until recovery completes
-        step("e2fsck -fy (journal replay before hashing)")
-        check_fs(ex, part, fix=True, bar=bar)
-        # measure AFTER fsck: it frees blocks orphaned by an interrupted
-        # resize2fs, so the pre-fsck count overstates real usage
-        facts = fs_facts(ex, part)
+        step("Preflight filesystem check (read-only; dirty disks are refused)")
+        check_fs(ex, part, fix=False, bar=bar)
         min_gib = int(facts.used_gib * 1.08) + 1
-        info(f"after fsck: {facts.used_gib:.1f} GiB in use (floor {min_gib} GiB)")
+        info(f"{facts.used_gib:.1f} GiB in use (floor {min_gib} GiB)")
+        if target_gib * _GIB >= facts.size_bytes:
+            raise ShrinkError("target must be smaller than the current filesystem size")
         if target_gib < min_gib:
             raise ShrinkError(
                 f"target {target_gib} GiB is below the safety floor "
@@ -164,9 +174,10 @@ def shrink(
         # resize2fs relocates every used block beyond the new fs end into free
         # space before it; on a trimmed sparse disk that allocates fresh host
         # grains, so the footprint spikes by that amount before -k reclaims it.
-        extent_sectors = stats.capacity_sectors // max(stats.extent_count, 1)
         new_end_sectors = geo.start_lba + target_gib * _GIB // SECTOR
-        keep = -(-new_end_sectors // extent_sectors)  # ceil
+        keep = compute_plan(
+            data_vmdk, fs_end_sector=new_end_sectors + GPT_TAIL_SECTORS
+        ).keep_extents
         per_extent = extent_allocations(data_vmdk)
         relocation = sum(per_extent[keep:])
         free_now = shutil.disk_usage(vm_dir).free
@@ -186,10 +197,9 @@ def shrink(
         zerofree_total_bytes = max(0, target_blocks - used_blocks) * facts.block_size
         session.nbd.disconnect()
 
-        baseline_path = vm_dir / "manifest_before.raw"
-        if resume and baseline_path.is_file():
-            step("Resume: reusing existing baseline manifest")
-            baseline = load(baseline_path)
+        if resume:
+            step("Resume: validated disk-bound baseline (no mutation was started)")
+            baseline = load(checkpoint.baseline)
             ok(f"baseline: {len(baseline)} files (cached)")
         else:
             step(f"Hashing baseline (every regular file, via {hash_via})")
@@ -197,11 +207,12 @@ def shrink(
                 hash_via,
                 vm_dir,
                 data_vmdk,
-                vm_dir / "manifest_before",
+                checkpoint.baseline.with_suffix(""),
                 session=session,
                 replicas=replicas,
                 bar=bar,
             )
+            checkpoint.baseline_ready(data_vmdk)
             ok(f"baseline: {len(baseline)} files hashed")
         # shed the WSL2 page cache before the write phase: multi-hundred-GiB
         # reads through the bind mount have been observed to kill the VM
@@ -211,7 +222,10 @@ def shrink(
             check=False,
         )
 
-    # -- shrink fs + partition ----------------------------------------------
+    # Mark BEFORE any repair/resize: no automatic replay after interruption.
+    require_offline(vm_dir)
+    checkpoint.save("mutation_started")
+    free_map = None
     if mode == "sidecar":
         sc = run_sidecar_fs_phase(
             vm_dir,
@@ -230,16 +244,10 @@ def shrink(
         if sc.free_ranges:
             # VM is off; the extent files are closed. Clear the grain-table
             # entries of every free block host-side — no zero-writes.
-            sc_map = FreeMap(
+            free_map = FreeMap(
                 start_lba=geo.start_lba, block_size=facts.block_size, ranges=sc.free_ranges
             )
-            info(describe(trim_with_map(data_vmdk, sc_map)))
     else:
-        # The drvfs/9p layer under Docker occasionally loses a request
-        # completion (vp9fs.dll Tflush race, microsoft/WSL#41702), wedging the
-        # phase. The phase therefore runs in its own session: a StallError
-        # tears the container down and a fresh one resumes — resize2fs and
-        # zerofree are both safe to re-run after an interrupted attempt.
         new_end, free_map = _shrink_fs_with_retry(
             vm_dir,
             data_vmdk,
@@ -251,12 +259,29 @@ def shrink(
             resize_total_bytes=resize_total_bytes,
             zerofree_total_bytes=zerofree_total_bytes,
         )
-        if free_map is not None:
-            # Host-side, on the now-closed extent files: clear the grain-table
-            # entries of every free block. No zero-writes, no drive wear.
-            info(describe(trim_with_map(data_vmdk, free_map)))
+    # Check filesystem surgery while original descriptor/extents still exist.
+    with open_session(vm_dir, paths=paths) as session:
+        interim = _hash_verification(
+            hash_via,
+            vm_dir,
+            data_vmdk,
+            checkpoint.directory / "filesystem",
+            session=session,
+            replicas=replicas,
+            bar=bar,
+        )
+    interim_diff = diff(baseline, interim)
+    if not interim_diff.identical:
+        checkpoint.save("verification_failed", verdict=interim_diff.summary())
+        err(f"Filesystem verification failed: {interim_diff.summary()}; no host cleanup performed")
+        return 2
+    checkpoint.save("filesystem_verified")
+    require_offline(vm_dir)
+    if free_map is not None:
+        info(describe(trim_with_map(data_vmdk, free_map)))
 
-    # -- host-side: descriptor rebuild, orphan deletion, compact ------------
+    # Capacity changes are necessary to verify the final geometry. Retain
+    # unreferenced extents until final hashes match; descriptor backup is not a disk backup.
     plan = compute_plan(data_vmdk, fs_end_sector=new_end + 1 + GPT_TAIL_SECTORS)
     step(
         f"Rebuilding descriptor: keep [val]{plan.keep_extents}[/val] extents "
@@ -264,20 +289,21 @@ def shrink(
         f"{len(plan.orphan_files)} orphan(s) to delete"
     )
     rebuild_descriptor(data_vmdk, plan)
-    deleted, freed = delete_orphans(plan)
-    ok(f"deleted {deleted} orphan extents ({freed / 2**30:.2f} GiB freed)")
+    checkpoint.save("descriptor_rebuilt", orphans=[str(p) for p in plan.orphan_files])
+
+    with open_session(vm_dir, paths=paths) as session:
+        disk = attach_rw(session, data_vmdk)
+        relocate_gpt_backup(session.executor, disk.device)
+        session.nbd.rescan(disk)
+        check_fs(session.executor, disk.partition(1), fix=False, bar=bar)
 
     step("vdiskmanager -k (compact)")
-    VDiskManager(paths).compact(data_vmdk)
+    compact_with_progress(VDiskManager(paths), data_vmdk)
 
     # -- verification pass (container) --------------------------------------
     with open_session(vm_dir, paths=paths) as session:
         ex = session.executor
-        disk = attach_rw(session, data_vmdk)
-        # after the capacity drop the backup GPT lies beyond the new end and
-        # the kernel registers no partitions: relocate it first
-        relocate_gpt_backup(ex, disk.device)
-        session.nbd.rescan(disk)
+        disk = attach_ro(session, data_vmdk, index=0)
         part = disk.partition(1)
         step("post-everything fsck (read-only)")
         check_fs(ex, part, fix=False, bar=bar)
@@ -287,20 +313,27 @@ def shrink(
             hash_via,
             vm_dir,
             data_vmdk,
-            vm_dir / "manifest_after",
+            checkpoint.directory / "after",
             session=session,
             replicas=replicas,
             bar=bar,
         )
 
-    base = load(vm_dir / "manifest_before.raw")
+    base = baseline
     result = diff(base, after_manifest)
     after = _du_bytes(before_files)
 
     console.print()
     if result.identical:
-        ok(f"[ok]ZERO DATA LOSS: all {len(base)} files byte-identical[/ok]")
+        checkpoint.save("verified")
+        require_offline(vm_dir)
+        deleted, freed = delete_orphans(plan)
+        ok(f"deleted {deleted} verified orphan extents ({freed / 2**30:.2f} GiB freed)")
+        checkpoint.save("complete")
+        after = _du_bytes(before_files)
+        ok(f"Regular-file contents verified: all {len(base)} files byte-identical")
     else:
+        checkpoint.save("verification_failed", verdict=result.summary())
         err(f"DATA DIFFERS: {result.summary()}")
         for p in result.changed[:10]:
             err(f"  changed: {p}")
@@ -317,9 +350,6 @@ def shrink(
     return 0 if result.identical else 2
 
 
-MAX_FS_ATTEMPTS = 4
-
-
 def _shrink_fs_with_retry(
     vm_dir: Path,
     data_vmdk: Path,
@@ -332,36 +362,28 @@ def _shrink_fs_with_retry(
     resize_total_bytes: int,
     zerofree_total_bytes: int,
 ) -> tuple[int, FreeMap | None]:
-    """Shrink the filesystem/partition in a dedicated session, retrying on stalls.
+    """Shrink once in a dedicated session; the historical name is retained.
 
     Returns the new fs end sector plus the free map collected for host-side
     grain trimming (None when zerofree already zeroed free space as fallback).
     """
-    for attempt in range(1, MAX_FS_ATTEMPTS + 1):
-        try:
-            with open_session(vm_dir, paths=paths, build=False) as session:
-                return _shrink_fs_phase(
-                    session,
-                    data_vmdk,
-                    target_gib,
-                    start_lba=start_lba,
-                    block_size=block_size,
-                    bar=bar,
-                    resize_total_bytes=resize_total_bytes,
-                    zerofree_total_bytes=zerofree_total_bytes,
-                )
-        except StallError as exc:
-            if attempt == MAX_FS_ATTEMPTS:
-                raise ShrinkError(
-                    f"filesystem phase stalled in {MAX_FS_ATTEMPTS} consecutive sessions: {exc}"
-                ) from exc
-            warn(f"{exc}")
-            warn(
-                f"recovering: tearing down the container and resuming in a fresh "
-                f"9p session (attempt {attempt + 1} of {MAX_FS_ATTEMPTS})"
+    try:
+        with open_session(vm_dir, paths=paths, build=False) as session:
+            return _shrink_fs_phase(
+                session,
+                data_vmdk,
+                target_gib,
+                start_lba=start_lba,
+                block_size=block_size,
+                bar=bar,
+                resize_total_bytes=resize_total_bytes,
+                zerofree_total_bytes=zerofree_total_bytes,
             )
-            time.sleep(15)
-    raise ShrinkError("unreachable")  # pragma: no cover - loop always returns/raises
+    except StallError as exc:
+        raise ShrinkError(
+            f"filesystem phase interrupted: {exc}; do not retry automatically. "
+            "Preserve the operation evidence and recover from a full backup."
+        ) from exc
 
 
 def _shrink_fs_phase(
@@ -375,15 +397,9 @@ def _shrink_fs_phase(
     resize_total_bytes: int,
     zerofree_total_bytes: int,
 ) -> tuple[int, FreeMap | None]:
-    """resize2fs + partition recreation + free-map collection, watched for stalls.
-
-    ``resize2fs`` is journal-atomic and resumable, and the whole phase is safe
-    to re-run after an interrupted attempt (the retry loop re-runs
-    ``e2fsck -fy`` first to release blocks orphaned by the kill). Free-space
-    reclamation is metadata-only grain trimming on the host afterwards.
-    """
+    """One filesystem mutation attempt. Repair cannot guarantee crash recovery."""
     ex = session.executor
-    disk = attach_rw(session, data_vmdk, unsafe_cache=True)
+    disk = attach_rw(session, data_vmdk)
     part = disk.partition(1)
     step(f"e2fsck -fy on {part}")
     check_fs(ex, part, fix=True)
@@ -444,9 +460,9 @@ def assert_shrinkable_layout(ex: Executor, disk: str, partition: str) -> None:
     it), and non-ext4 filesystems fail mid-pipeline after destructive steps
     have already run.
     """
-    if count_partitions(ex, disk) > 1:
+    if count_partitions(ex, disk) != 1:
         raise ShrinkError(
-            "the data disk has more than one partition; this tool shrinks "
+            "the data disk must have exactly one partition; this tool shrinks "
             "single-partition ext4 disks only (other partitions would be "
             "silently truncated on the descriptor rebuild). Use a full-disk "
             "backup/restore path instead."
@@ -460,10 +476,5 @@ def assert_shrinkable_layout(ex: Executor, disk: str, partition: str) -> None:
 
 
 def _largest_split_sparse(vm_dir: Path) -> Path:
-    """Pick the disk whose descriptor lists the most extents (the data disk)."""
-    candidates = [
-        d for d in vm_dir.glob("*.vmdk") if list(vm_dir.glob(d.with_suffix("").name + "-s*.vmdk"))
-    ]
-    if not candidates:
-        raise ShrinkError(f"no split-sparse VMDK in {vm_dir}")
-    return max(candidates, key=lambda d: len(extent_list(d)))
+    """Compatibility entry point for shared, unambiguous descriptor selection."""
+    return select_disk(vm_dir)

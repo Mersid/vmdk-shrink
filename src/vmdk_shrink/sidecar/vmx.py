@@ -28,10 +28,7 @@ sata0:0.present = "TRUE"
 sata0:0.fileName = "{boot_disk}"
 sata0:1.present = "TRUE"
 sata0:1.fileName = "{data_disk}"
-ide1:0.present = "TRUE"
-ide1:0.fileName = "{seed_iso}"
-ide1:0.deviceType = "cdrom-image"
-ide1:0.startConnected = "TRUE"
+{seed_cdrom}
 ethernet0.present = "TRUE"
 ethernet0.connectionType = "nat"
 ethernet0.virtualDev = "{eth_dev}"
@@ -74,7 +71,7 @@ powerType.reset = "soft"
 
 @dataclass(frozen=True)
 class SidecarVmxSpec:
-    """Everything the VMX needs; the data disk is attached, never copied."""
+    """VMX inputs; seed_iso is legacy opt-in, normal boots use an on-disk seed."""
 
     boot_disk: Path
     data_disk: Path
@@ -82,20 +79,27 @@ class SidecarVmxSpec:
     serial_log: Path = Path("")
     memsize_mb: int = 2048
     cpus: int = 2
-    scsi_dev: str = "lsilogic"
+    scsi_dev: str = "lsilogic"  # Legacy compatibility; disks now use SATA.
     eth_dev: str = "vmxnet3"
     hw_version: str = "22"
 
     def render(self) -> str:
+        seed_cdrom = 'ide1:0.present = "FALSE"'
+        if self.seed_iso != Path(""):
+            seed_cdrom = (
+                'ide1:0.present = "TRUE"\n'
+                f'ide1:0.fileName = "{self.seed_iso}"\n'
+                'ide1:0.deviceType = "cdrom-image"\n'
+                'ide1:0.startConnected = "TRUE"'
+            )
         return VMX_TEMPLATE.format(
             memsize=self.memsize_mb,
             cpus=self.cpus,
-            scsi_dev=self.scsi_dev,
             eth_dev=self.eth_dev,
             hw_version=self.hw_version,
             boot_disk=self.boot_disk,
             data_disk=self.data_disk,
-            seed_iso=self.seed_iso,
+            seed_cdrom=seed_cdrom,
             serial_log=self.serial_log,
         )
 

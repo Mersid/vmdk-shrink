@@ -19,7 +19,7 @@ H4 = "d" * 64
 
 
 def write_manifest(path: Path, lines: list[str]) -> Path:
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
     return path
 
 
@@ -127,6 +127,11 @@ def test_parse_free_ranges_separates_summary_from_group_lines() -> None:
         "  Free blocks: 40000-40000\n"
     )
     assert parse_free_ranges(text) == [(8615, 32767), (33025, 33279), (40000, 40000)]
+
+
+def test_parse_free_ranges_singleton_only_groups() -> None:
+    text = "Free blocks: 3\n  Free blocks: 12\n  Free blocks: 40, 42\n  Free blocks: \n"
+    assert parse_free_ranges(text) == [(12, 12), (40, 40), (42, 42)]
 
 
 def test_nbd_written_reads_write_sectors_not_inflight() -> None:

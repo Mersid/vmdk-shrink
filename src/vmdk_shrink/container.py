@@ -1,26 +1,24 @@
-"""Docker container hosting the Linux block-device toolchain.
+"""Privileged Linux toolchain and Docker execution/lifecycle adapter.
 
-The container replaces the old helper VM: it runs ``--privileged`` so
-``qemu-nbd`` can expose a VMDK as ``/dev/nbd*``, and the VM directory is
-bind-mounted so the disk files are used in place (no copies). Nothing is
-installed on the host beyond the image itself — ``docker rm`` + ``docker rmi``
-removes every trace.
+The VM directory is bind-mounted for in-place disk access. Manifests,
+checkpoints, and optional sidecar artifacts persist outside the container.
 """
 
 from __future__ import annotations
 
 import os
 import subprocess
-import time
 from pathlib import Path
 
 from .console import info, ok, step, warn
+from .execution import stream_process
 from .executor import ExecError, ExecResult
 from .paths import DEFAULT_PATHS, HostPaths
 
 IMAGE_NAME = "vmdk-shrink"
-IMAGE_TAG = f"{IMAGE_NAME}:latest"
+IMAGE_TAG = f"{IMAGE_NAME}:toolchain-v2"
 CONTAINER_PREFIX = IMAGE_NAME
+NBD_LOCK_CONTAINER = f"{IMAGE_NAME}-nbd-lock"
 WORK_MOUNT = "/work"
 
 
@@ -46,6 +44,7 @@ class Container:
         self._name = name or f"{CONTAINER_PREFIX}-{os.getpid()}"
         self._mounts = mounts
         self._running = False
+        self._lock_id: str | None = None
 
     # ------------------------------------------------------------ image ----
     def image_exists(self) -> bool:
@@ -57,19 +56,25 @@ class Container:
             info(f"image [val]{self._image}[/val] already present")
             return
         step(f"Building image [val]{self._image}[/val]")
-        proc = self._docker("build", "-t", self._image, str(dockerfile.parent), capture=False)
+        proc = self._docker(
+            "build", "-t", self._image, "-f", str(dockerfile), str(dockerfile.parent), capture=False
+        )
         if proc.returncode != 0:
             raise ContainerError(f"docker build failed (rc={proc.returncode})")
         ok(f"image built: {self._image}")
 
     def remove_image(self) -> None:
-        self._docker("rmi", "-f", self._image, capture=False)
+        result = self._docker("rmi", self._image, capture=False)
+        if result.returncode != 0:
+            raise ContainerError(f"image removal failed: {result.stderr or result.stdout}")
 
     def running_status(self) -> str | None:
         """Status string if the container is running, else None."""
         proc = self._docker(
-            "ps", "--filter", f"name=^/{self._name}$", "--format", "{{.Names}} {{.Status}}"
+            "ps", "--filter", f"name=^/{CONTAINER_PREFIX}", "--format", "{{.Names}} {{.Status}}"
         )
+        if proc.returncode != 0:
+            raise ContainerError(f"cannot query Docker status: {proc.stderr or proc.stdout}")
         out = proc.stdout.strip() if proc.returncode == 0 else ""
         return out or None
 
@@ -77,7 +82,14 @@ class Container:
     def start(self) -> None:
         self._ensure_nbd_module()
         self._refuse_concurrent()
-        self._remove_stale()
+        lock = self._docker("create", "--name", NBD_LOCK_CONTAINER, self._image, "true")
+        if lock.returncode != 0:
+            raise ContainerError(
+                f"NBD ownership lock unavailable ({NBD_LOCK_CONTAINER}); another operation "
+                "may be active. After a crash, confirm all workers are off before "
+                "manually removing the lock container. " + (lock.stderr or "")
+            )
+        self._lock_id = lock.stdout.strip()
         args = ["run", "-d", "--name", self._name, "--privileged", "--init"]
         for host, cont in self._mounts:
             args += ["-v", f"{host}:{cont}"]
@@ -85,18 +97,30 @@ class Container:
         proc = self._docker(*args, capture=True)
         if proc.returncode != 0:
             raise ContainerError(
-                f"docker run failed: {(proc.stdout or '') + (proc.stderr or '')}".strip()
+                f"docker run failed; NBD lock retained for manual assessment: "
+                f"{(proc.stdout or '') + (proc.stderr or '')}".strip()
             )
         self._running = True
         ok(f"container [val]{self._name}[/val] running")
 
     def stop(self, *, remove: bool = True) -> None:
         if remove:
-            self._docker("rm", "-f", self._name, capture=True)
+            proc = self._docker("rm", "-f", self._name, capture=True)
+            if proc.returncode != 0:
+                raise ContainerError(
+                    f"container removal failed; disk may be attached: {proc.stderr}"
+                )
             self._running = False
+            if self._lock_id is not None:
+                lock = self._docker("rm", self._lock_id)
+                if lock.returncode != 0:
+                    raise ContainerError("container stopped, but NBD ownership lock removal failed")
+                self._lock_id = None
             info(f"container [val]{self._name}[/val] removed")
         else:
-            self._docker("stop", self._name, capture=True)
+            proc = self._docker("stop", self._name, capture=True)
+            if proc.returncode != 0:
+                raise ContainerError(f"container stop failed: {proc.stderr}")
             self._running = False
 
     def __enter__(self) -> Container:
@@ -131,27 +155,18 @@ class Container:
     def stream(
         self, command: str, *, timeout: float = 7200.0, chunk_cb: object = None
     ) -> ExecResult:
-        proc = subprocess.Popen(
-            [str(self._paths.docker), "exec", self._name, "bash", "-c", command],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            bufsize=1,
-        )
-        assert proc.stdout is not None
-        collected: list[str] = []
-        deadline = time.monotonic() + timeout
-        for line in proc.stdout:
-            collected.append(line)
-            if callable(chunk_cb):
-                chunk_cb(line)
-            if time.monotonic() > deadline:
-                proc.kill()
-                raise ExecError(f"command timed out after {timeout:.0f}s: {command}")
-        proc.wait(timeout=30)
-        return ExecResult(command=command, exit_code=proc.returncode, output="".join(collected))
+        try:
+            proc = stream_process(
+                [str(self._paths.docker), "exec", self._name, "bash", "-c", command],
+                timeout=timeout,
+                chunk_cb=chunk_cb,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise ExecError(
+                f"command timed out after {timeout:.0f}s; guest command may still be running: "
+                f"{command}"
+            ) from exc
+        return ExecResult(command=command, exit_code=proc.returncode, output=proc.stdout)
 
     # ----------------------------------------------------------- paths ----
     def to_container_path(self, host_path: Path) -> str:
@@ -182,10 +197,10 @@ class Container:
         try:
             return subprocess.run(
                 cmd,
-                capture_output=True,
+                capture_output=capture,
                 text=True,
                 encoding="utf-8",
-                errors="replace",
+                errors="surrogateescape",
                 timeout=timeout,
             )
         except subprocess.TimeoutExpired as exc:
@@ -205,34 +220,14 @@ class Container:
         proc = self._docker(
             "ps", "--filter", f"name=^/{CONTAINER_PREFIX}", "--format", "{{.Names}}"
         )
+        if proc.returncode != 0:
+            raise ContainerError("cannot establish whether another NBD session is running")
         live = [n for n in (proc.stdout or "").split() if n and n != self._name]
         if live:
             raise ContainerError(
                 f"another pipeline is already running (container {live[0]!r}); "
                 "only one vmdk-shrink session can run at a time"
             )
-
-    def _remove_stale(self) -> None:
-        """Sweep dead sessions from earlier crashed runs (never live ones)."""
-        proc = self._docker(
-            "ps",
-            "-a",
-            "--filter",
-            f"name=^/{CONTAINER_PREFIX}",
-            "--filter",
-            "status=created",
-            "--filter",
-            "status=exited",
-            "--filter",
-            "status=dead",
-            "--format",
-            "{{.ID}} {{.Names}}",
-        )
-        for line in (proc.stdout or "").splitlines():
-            cid, _, name = line.partition(" ")
-            if cid:
-                warn(f"removing stale container [val]{name or cid}[/val]")
-                self._docker("rm", "-f", cid)
 
     def _ensure_nbd_module(self) -> None:
         """Load the nbd kernel module into Docker Desktop's WSL2 kernel.

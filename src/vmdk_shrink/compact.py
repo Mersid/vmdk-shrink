@@ -1,25 +1,35 @@
-"""``vmdk compact``: reclaim host space WITHOUT touching the guest filesystem.
+"""Host-space reclamation without reducing filesystem or virtual capacity.
 
-zerofree zeroes free blocks that still hold stale data (it skips blocks that
-are already zero, so host files never balloon), then ``vmware-vdiskmanager -k``
-deallocates the now-zero grains.
-Capacity is never reduced — a running guest can expand the disk again on demand.
+Filesystem repair may change metadata. Use a full backup before this operation.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 
 from .console import err, info, ok, step
 from .fsops import activate_lvm, check_fs, ext4_devices, fs_facts, nbd_written, zerofree
 from .nbd import NbdDisk
 from .paths import DEFAULT_PATHS, HostPaths
+from .presentation import compact_with_progress
 from .progress import PhaseBar
-from .reclaim import FreeMap, collect_free_map, describe, trim_with_map
+from .reclaim import FreeMap, TrimUnavailable, collect_free_map, describe, trim_with_map
+from .safety import offline_operation, require_offline
 from .session import attach_rw, open_session
-from .sidecar.orchestrator import RealVmrun, SidecarError
 from .vdiskmanager import VDiskManager
-from .vmdk_parser import VmdkFormatError, extent_list, grain_stats
+from .vmdk_parser import extent_list, grain_stats, validate_writable
+
+
+@dataclass(frozen=True)
+class CompactionResult:
+    before_bytes: int
+    after_bytes: int
+    disks: tuple[Path, ...]
+
+    @property
+    def bytes_freed(self) -> int:
+        return self.before_bytes - self.after_bytes
 
 
 def _du_bytes(paths: list[Path]) -> int:
@@ -33,42 +43,34 @@ def _extent_files(vmdk: Path) -> list[Path]:
     sNNN.vmdk after a convert), and a missed extent leaves its allocated
     blocks unaccounted in the footprint math.
     """
-    try:
-        return [vmdk.parent / name for _, name in extent_list(vmdk)]
-    except VmdkFormatError:
-        return []  # monolithic/flat: the descriptor file is the whole disk
+    return [vmdk.parent / name for _, name in extent_list(vmdk)]
 
 
+@offline_operation()
 def compact_disk(
     vmdk: Path,
     *,
     extra_vmdks: tuple[Path, ...] = (),
     zerofree_fs: bool = True,
     paths: HostPaths = DEFAULT_PATHS,
-) -> int:
-    """Compact host footprint. Returns bytes freed (negative = grew).
+) -> CompactionResult:
+    """Compact host footprint. Failures raise; the result contains byte counts.
 
     ``extra_vmdks`` are zerofree'd (every ext4 under each disk, including LVM
     logical volumes) and compacted alongside the main disk — pass the boot
     disk to reclaim its space too.
     """
     vmdk = Path(vmdk).resolve()
-    target_vmdks = (vmdk, *extra_vmdks)
+    target_vmdks = (vmdk, *(p.resolve() for p in extra_vmdks))
     vm_dir = vmdk.parent
-    vmrun = RealVmrun(paths)
-    for vmx in sorted(vm_dir.glob("*.vmx")):
-        try:
-            live = vmrun.is_running(vmx)
-        except SidecarError:
-            live = False  # vmrun unusable: vdiskmanager's own lock check decides
-        if live:
-            err(
-                f"{vmx.name} is running — vmware-vdiskmanager cannot compact "
-                "the disks of a live VM; power it off first"
-            )
-            return 1
+    if len(set(target_vmdks)) != len(target_vmdks):
+        raise ValueError("each target disk must be listed only once")
+    for target in target_vmdks:
+        if target.parent != vm_dir:
+            raise ValueError("all disks must be directly inside the VM directory")
+        validate_writable(target)
     step(f"Compact-only mode for [val]{', '.join(v.name for v in target_vmdks)}[/val]")
-    step("Filesystem size is NOT touched — capacity stays as-is")
+    step("Capacity stays unchanged; filesystem checks may repair metadata")
 
     before_files = [f for t in target_vmdks for f in (t, *_extent_files(t))]
     before = _du_bytes(before_files)
@@ -80,9 +82,8 @@ def compact_disk(
     )
 
     if zerofree_fs:
-        bar = PhaseBar()
         trim_maps: list[tuple[Path, FreeMap]] = []
-        with open_session(vmdk.parent, paths=paths) as session:
+        with PhaseBar() as bar, open_session(vmdk.parent, paths=paths) as session:
             ex = session.executor
             for t in target_vmdks:
                 disk = attach_rw(session, t)
@@ -106,8 +107,13 @@ def compact_disk(
                             # Grain-table trim: the fs free map drives GTE
                             # clearing on the closed files — no zero-writes.
                             # Collected here, applied after the session ends.
-                            trim_maps.append((t, collect_free_map(ex, disk)))
-                            continue
+                            try:
+                                free_map = collect_free_map(ex, disk)
+                            except TrimUnavailable:
+                                pass  # fall back to zerofree, not an ignored failure
+                            else:
+                                trim_maps.append((t, free_map))
+                                continue
                         # Stacked volumes (LVM) can't be projected to disk
                         # sectors: fall back to zero-writing free blocks.
                         step(f"zerofree [val]{dev}[/val]")
@@ -123,20 +129,16 @@ def compact_disk(
                         info(
                             output.strip().splitlines()[-1] if output.strip() else "nothing to zero"
                         )
-                except Exception as exc:  # noqa: BLE001 - best effort per disk
-                    info(f"free-space reclaim skipped for {t.name}: {exc}")
                 finally:
                     session.nbd.disconnect()
-        bar.close()
         for t, free_map in trim_maps:
-            try:
-                info(describe(trim_with_map(t, free_map)))
-            except Exception as exc:  # noqa: BLE001 - never fail a compact at trim
-                info(f"grain-table trim skipped for {t.name}: {exc}")
+            require_offline(vm_dir)
+            info(describe(trim_with_map(t, free_map)))
 
     for t in target_vmdks:
+        require_offline(vm_dir)
         step(f"vdiskmanager -k on [val]{t.name}[/val]")
-        VDiskManager(paths).compact(t)
+        compact_with_progress(VDiskManager(paths), t)
 
     after = _du_bytes(before_files)
     freed = before - after
@@ -144,4 +146,4 @@ def compact_disk(
         ok(f"freed [ok]{freed / 2**30:.2f} GiB[/ok] ({before / 2**30:.1f} -> {after / 2**30:.1f})")
     else:
         err(f"host files grew by {abs(freed) / 2**30:.2f} GiB (unexpected)")
-    return freed
+    return CompactionResult(before, after, target_vmdks)

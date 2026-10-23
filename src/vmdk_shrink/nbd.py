@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
+from shlex import quote
 
 from .console import info, step, warn
 from .container import Container
@@ -76,17 +77,18 @@ class NbdSession:
     def connect(
         self, container_vmdk: str, *, read_only: bool = False, unsafe_cache: bool = False
     ) -> NbdDisk:
-        """Attach ``container_vmdk`` to ``/dev/nbd<index>`` and return the disk.
-
-        ``unsafe_cache`` adds ``--cache=unsafe`` for read-write work: ext4's
-        journal commits sync all the way down through Docker's drvfs layer,
-        which throttles relocation to ~10 MB/s; skipping those fsyncs roughly
-        doubles throughput. Data still lands in the VM page cache immediately
-        (coherent across reconnects); only a VM crash inside the writeback
-        window can lose recent blocks, which ``e2fsck -fy`` repairs and the
-        final manifest diff would catch.
-        """
-        self.disconnect(check=False)
+        """Attach with durable flush semantics; unsafe write caching is refused."""
+        if unsafe_cache:
+            raise NbdError("unsafe write caching is not supported; a hash cannot recover lost data")
+        if self._connected:
+            self.disconnect()
+        occupied = self._c.run(
+            f"cat /sys/block/nbd{self._index}/pid 2>/dev/null || true", timeout=20
+        ).output.strip()
+        if occupied:
+            raise NbdError(
+                f"{self.device} already has an owner; refusing to detach another session"
+            )
         # Docker's /dev is static: the nbd nodes do not exist until we make them.
         self._c.run(
             f"rm -f {self.device} 2>/dev/null || true; "
@@ -94,9 +96,7 @@ class NbdSession:
             timeout=30,
         )
 
-        flag = "-r" if read_only else ""
-        if unsafe_cache and not read_only:
-            flag += " --cache=unsafe"
+        flag = "-r" if read_only else "--cache=writeback"
         step(f"qemu-nbd [val]{'RO' if read_only else 'RW'}[/val] {container_vmdk}")
         # "Permission denied" on an extent is transient: Docker's file-share
         # layer releases handles asynchronously after a disconnect, and
@@ -109,7 +109,7 @@ class NbdSession:
                 time.sleep(delay)
                 step(f"retrying qemu-nbd connect (attempt {attempt + 1}, after {delay}s)")
             self._c.run_detached(
-                f"qemu-nbd {flag} -f vmdk -c {self.device} '{container_vmdk}' "
+                f"qemu-nbd {flag} -f vmdk -c {self.device} {quote(container_vmdk)} "
                 f">/tmp/nbd{self._index}.log 2>&1"
             )
             sectors = self._wait_capacity(timeout=30.0)
@@ -128,28 +128,25 @@ class NbdSession:
         raise NbdError(f"nbd device {self.device} never reported a capacity: {last_err}")
 
     def disconnect(self, *, check: bool = True) -> None:
-        # Graceful detach first: NBD_CMD_DISC lets the daemon drain and exit on
-        # its own. Killing a daemon that still has in-flight requests hurls a
-        # burst of 9p Tflush messages into Docker's drvfs layer — the known
-        # trigger for the vp9fs.dll Tflush race (microsoft/WSL#41702) that
-        # leaves a mount permanently wedged. The kill is a last resort for a
-        # daemon stuck in unwedgeable I/O, and uses a /proc walk because the
-        # image has no procps.
-        self._c.run(
-            f"timeout 30 qemu-nbd -d {self.device} >/dev/null 2>&1 || true",
-            timeout=60,
-            check=False,
-        )
-        time.sleep(2)
-        self._c.run(
-            "for p in /proc/[0-9]*/cmdline; do "
-            "c=$(tr '\\0' ' ' < \"$p\" 2>/dev/null); "
-            'case "$c" in *qemu-nbd*\'-c ' + self.device + "'*) "
-            'd=${p%/cmdline}; kill -9 "${d#/proc/}" 2>/dev/null || true;; '
-            "esac; done",
-            timeout=30,
-            check=False,
-        )
+        if not self._connected:
+            return
+        # Never kill a daemon with outstanding writes and then proceed to host edits.
+        flushed = self._c.run(f"blockdev --flushbufs {self.device}", timeout=120, check=False)
+        detached = self._c.run(f"qemu-nbd -d {self.device}", timeout=120, check=False)
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            owner = self._c.run(
+                f"cat /sys/block/nbd{self._index}/pid 2>/dev/null || true",
+                timeout=10,
+                check=False,
+            )
+            if owner.ok and not owner.output.strip():
+                break
+            time.sleep(0.5)
+        else:
+            raise NbdError(f"{self.device} did not detach; host edits are unsafe")
+        if not flushed.ok or not detached.ok:
+            raise NbdError(f"{self.device} flush/detach failed; preserve the disk for recovery")
         self._connected = False
 
     def __enter__(self) -> NbdSession:

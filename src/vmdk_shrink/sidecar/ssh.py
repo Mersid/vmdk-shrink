@@ -12,11 +12,11 @@ from __future__ import annotations
 
 import shutil
 import subprocess
-import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
+from ..execution import stream_process
 from ..executor import ExecError, ExecResult
 
 
@@ -89,7 +89,7 @@ class SshRunner:
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
-                errors="replace",
+                errors="surrogateescape",
                 timeout=timeout,
                 check=False,
             )
@@ -116,26 +116,10 @@ class SshRunner:
         Same shape as :meth:`vmdk_shrink.container.Container.stream`, so
         ``manifest.collect`` runs against a guest unchanged.
         """
-        proc = subprocess.Popen(  # noqa: S603 - fixed argv, no user input
-            self._argv(command),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            bufsize=1,
-        )
-        assert proc.stdout is not None
-        collected: list[str] = []
-        deadline = time.monotonic() + timeout
-        for line in proc.stdout:
-            collected.append(line)
-            if callable(chunk_cb):
-                chunk_cb(line)
-            if time.monotonic() > deadline:
-                proc.kill()
-                raise SshError(f"ssh stream timed out after {timeout:.0f}s: {command[:120]}")
-        proc.wait(timeout=30)
-        return ExecResult(
-            command=command, exit_code=proc.returncode, output="".join(collected)
-        )
+        try:
+            proc = stream_process(self._argv(command), timeout=timeout, chunk_cb=chunk_cb)
+        except subprocess.TimeoutExpired as exc:
+            raise SshError(f"ssh stream timed out after {timeout:.0f}s: {command[:120]}") from exc
+        except OSError as exc:
+            raise SshError(f"ssh failed to start: {exc}") from exc
+        return ExecResult(command=command, exit_code=proc.returncode, output=proc.stdout or "")

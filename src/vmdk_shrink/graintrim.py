@@ -22,6 +22,7 @@ either.
 
 from __future__ import annotations
 
+import os
 import struct
 from dataclasses import dataclass
 from pathlib import Path
@@ -31,11 +32,8 @@ from .vmdk_parser import (
     SECTOR,
     ExtentHeader,
     VmdkFormatError,
-    _iter_extent_files,
-    _parse_extent_header,
+    validated_extent_headers,
 )
-
-GTE_ZERO_MARK = 0x80000000  # compressed/known-zero marker; also reads as zero
 
 
 @dataclass(frozen=True)
@@ -75,12 +73,12 @@ def fs_blocks_to_sectors(
     ranges: list[tuple[int, int]], *, start_lba: int, block_size: int
 ) -> list[tuple[int, int]]:
     """Convert fs-block ranges (inclusive) to absolute disk sectors (inclusive)."""
-    if block_size % SECTOR:
+    if block_size <= 0 or block_size % SECTOR or start_lba < 0:
         raise VmdkFormatError(f"block size {block_size} not sector-aligned")
     step = block_size // SECTOR
     out: list[tuple[int, int]] = []
     for first, last in ranges:
-        if last < first:
+        if first < 0 or last < first:
             raise VmdkFormatError(f"reversed free-block range {first}-{last}")
         out.append((start_lba + first * step, start_lba + (last + 1) * step - 1))
     return out
@@ -95,7 +93,7 @@ def merge_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
     """
     merged: list[tuple[int, int]] = []
     for start, end in sorted(ranges):
-        if end < start:
+        if start < 0 or end < start:
             raise VmdkFormatError(f"reversed sector range {start}-{end}")
         if merged and start <= merged[-1][1] + 1:
             merged[-1] = (merged[-1][0], max(merged[-1][1], end))
@@ -110,12 +108,18 @@ def trim_free_grains(descriptor: Path, free_sector_ranges: list[tuple[int, int]]
     ``free_sector_ranges`` are absolute disk sectors (inclusive, unsorted is
     fine). Partially covered grains are skipped untouched; grains already
     unallocated cost nothing. Only grain-table sectors are ever written.
+    Redundant tables are checked disk-wide before writes and updated together,
+    then flushed and fsynced per extent. Writes are not crash-atomic: an I/O
+    failure or interruption can leave mismatched copies, rejected on preflight.
     """
     merged = merge_ranges(free_sector_ranges)
+    headers = validated_extent_headers(Path(descriptor))
+    capacity = sum(h.capacity_sectors for h in headers)
+    if any(end >= capacity for _, end in merged):
+        raise VmdkFormatError("free-sector range is outside disk capacity")
     acc = _Acc(merged_ranges=len(merged))
     disk_base = 0
-    for path in _iter_extent_files(Path(descriptor)):
-        hdr = _parse_extent_header(path)
+    for hdr in headers:
         lo, hi = disk_base, disk_base + hdr.capacity_sectors - 1
         local = [
             (max(s, lo) - disk_base, min(e, hi) - disk_base)
@@ -123,19 +127,21 @@ def trim_free_grains(descriptor: Path, free_sector_ranges: list[tuple[int, int]]
             if s <= hi and e >= lo
         ]
         if local:
-            _trim_extent(path, hdr, local, acc)
+            _trim_extent(hdr.path, hdr, local, acc)
         disk_base += hdr.capacity_sectors
     return acc.stats()
 
 
-def _trim_extent(
-    path: Path, hdr: ExtentHeader, local: list[tuple[int, int]], acc: _Acc
-) -> None:
+def _trim_extent(path: Path, hdr: ExtentHeader, local: list[tuple[int, int]], acc: _Acc) -> None:
     grain_sectors = hdr.grain_sectors
     per_gt = hdr.gt_entries_per_table
     with path.open("r+b") as f:
         f.seek(hdr.gd_offset * SECTOR)
         gd = list(struct.unpack(f"<{hdr.gd_entries}I", f.read(hdr.gd_entries * 4)))
+        rgd: tuple[int, ...] | None = None
+        if hdr.rgd_offset:
+            f.seek(hdr.rgd_offset * SECTOR)
+            rgd = struct.unpack(f"<{hdr.gd_entries}I", f.read(hdr.gd_entries * 4))
         gt_cache: dict[int, list[int]] = {}
         dirty: set[int] = set()
 
@@ -160,7 +166,7 @@ def _trim_extent(
                 if gt is None:
                     gt = list(_read_gt(f, gt_sector, per_gt))
                     gt_cache[gt_index] = gt
-                if gt[slot] == 0:
+                if gt[slot] == 0 or (gt[slot] == 1 and hdr.flags & 4):
                     continue  # already unallocated
                 gt[slot] = 0
                 dirty.add(gt_index)
@@ -168,11 +174,17 @@ def _trim_extent(
                 acc.bytes_freed += hdr.grain_bytes
 
         for gt_index in sorted(dirty):
-            gt_sector = gd[gt_index]
-            f.seek(gt_sector * SECTOR)
-            f.write(struct.pack(f"<{per_gt}I", *gt_cache[gt_index]))
-            acc.gt_writes += 1
-        f.flush()
+            copies = [gd[gt_index]]
+            if rgd is not None:
+                copies.append(rgd[gt_index])
+            content = struct.pack(f"<{per_gt}I", *gt_cache[gt_index])
+            for gt_sector in copies:
+                f.seek(gt_sector * SECTOR)
+                f.write(content)
+                acc.gt_writes += 1
+        if dirty:
+            f.flush()
+            os.fsync(f.fileno())
 
 
 def _read_gt(f: BinaryIO, gt_sector: int, per_gt: int) -> tuple[int, ...]:

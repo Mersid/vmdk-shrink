@@ -15,7 +15,6 @@ gate, and the manifest collector. The only new logic is the glue that says
 from __future__ import annotations
 
 import shlex
-import time
 from pathlib import Path
 
 from ..console import err, info, ok, step, warn
@@ -29,11 +28,12 @@ from .gates import GateError, identify_data_disk, probe_fs_uuid, wait_ssh_ready
 from .image import ensure_base_image
 from .orchestrator import (
     CLOUD_INIT_TIMEOUT,
-    POWER_OFF_TIMEOUT_S,
     SSH_WAIT_ATTEMPTS,
     SSH_WAIT_DELAY_S,
     RealVmrun,
     SidecarError,
+    shutdown_sidecar,
+    sidecar_lifecycle,
 )
 from .seed import SEED_USER, generate_keypair
 from .ssh import SshConfig, SshRunner
@@ -80,6 +80,36 @@ def hash_via_sidecar(
     vm_dir = Path(vm_dir).resolve()
     data_vmdk = Path(data_vmdk).resolve()
     sidecar_dir = vm_dir / ".sidecar"
+    vmrun = RealVmrun(paths)
+    with sidecar_lifecycle(sidecar_dir, vmrun):
+        return _hash_locked(
+            vm_dir,
+            data_vmdk,
+            sidecar_dir=sidecar_dir,
+            vmrun=vmrun,
+            out_path=out_path,
+            paths=paths,
+            bar=bar,
+            fs_uuid=fs_uuid,
+            expected_partition_bytes=expected_partition_bytes,
+        )
+
+
+def _hash_locked(
+    vm_dir: Path,
+    data_vmdk: Path,
+    *,
+    sidecar_dir: Path,
+    vmrun: RealVmrun,
+    out_path: Path,
+    paths: HostPaths,
+    bar: PhaseBar | None,
+    fs_uuid: str | None,
+    expected_partition_bytes: int | None,
+) -> Manifest:
+    vmx = sidecar_dir / "sidecar.vmx"
+    if vmrun.is_running(vmx):
+        raise SidecarError("sidecar VM is already running; stop it first")
 
     if fs_uuid is None or expected_partition_bytes is None:
         step("Probing data filesystem identity (read-only container attach)")
@@ -99,15 +129,13 @@ def hash_via_sidecar(
         info(f"data filesystem: [val]{fs_uuid}[/val], {expected_partition_bytes} bytes")
 
     _ensure_artifacts(sidecar_dir, data_vmdk, paths)
-    vmrun = RealVmrun(paths)
-    vmx = sidecar_dir / "sidecar.vmx"
     if vmrun.is_running(vmx):
         raise SidecarError("sidecar VM is already running; stop it first")
 
     step("Booting sidecar VM for hashing")
-    vmrun.start(vmx)
     runner: _SudoStream | None = None
     try:
+        vmrun.start(vmx)
         subnet = vmnet8_subnet()
         ip = wait_for_guest_ip(vmx, subnet=subnet, attempts=40, delay_s=15.0)
         info(f"sidecar IP: [val]{ip}[/val] (NAT {subnet})")
@@ -134,18 +162,13 @@ def hash_via_sidecar(
             manifest = collect(runner, mount=GUEST_MOUNT, out_path=out_path, bar=bar)
         finally:
             runner.run(f"umount {GUEST_MOUNT}", timeout=300, check=False)
-        _shutdown(vmrun, vmx)
+        _shutdown(vmrun, vmx, runner)
         ok(f"hashed {len(manifest)} files via sidecar -> {out_path.with_suffix('.raw').name}")
         return manifest
     except Exception:
         err("sidecar hash failed — powering the sidecar off")
         try:
-            if vmrun.is_running(vmx):
-                try:
-                    vmrun.stop(vmx)
-                except SidecarError:
-                    warn("graceful poweroff failed; falling back to stop hard")
-                    vmrun.stop(vmx, hard=True)
+            _shutdown(vmrun, vmx, runner)
         except SidecarError:
             warn("could not power off sidecar via vmrun; stop it manually")
         raise
@@ -153,23 +176,8 @@ def hash_via_sidecar(
         del runner  # connection closes with its process
 
 
-def _shutdown(vmrun: RealVmrun, vmx: Path) -> None:
-    step("Powering sidecar off (graceful)")
-    # The guest is a hash reader only; a graceful stop is courtesy, hard is safe.
-    deadline = time.monotonic() + POWER_OFF_TIMEOUT_S
-    try:
-        vmrun.stop(vmx)
-    except SidecarError:
-        warn("graceful poweroff failed; falling back to stop hard")
-        vmrun.stop(vmx, hard=True)
-        return
-    while time.monotonic() < deadline:
-        if not vmrun.is_running(vmx):
-            ok("sidecar powered off")
-            return
-        time.sleep(5)
-    warn("graceful poweroff timed out; hard-stopping (guest only ever read)")
-    vmrun.stop(vmx, hard=True)
+def _shutdown(vmrun: RealVmrun, vmx: Path, runner: _SudoStream | None = None) -> None:
+    shutdown_sidecar(vmrun, vmx, runner)
 
 
 def _ensure_artifacts(sidecar_dir: Path, data_vmdk: Path, paths: HostPaths) -> None:
@@ -178,11 +186,10 @@ def _ensure_artifacts(sidecar_dir: Path, data_vmdk: Path, paths: HostPaths) -> N
     Mirrors the orchestrator's proven recipe: the NoCloud seed is BAKED into
     the boot image at ``/var/lib/cloud/seed/nocloud/`` (ds-identify ignores
     CD-ROM seeds on Workstation NAT and would disable cloud-init entirely).
-    The bake is re-run every time - it is idempotent, and cached conversions
-    may predate the seed.
+    Image preparation re-bakes cached conversions under its cache lock:
+    older conversions may predate the seed.
     """
     from ..container import Container
-    from .image import _force_nocloud
     from .seed import meta_data, user_data
 
     seed_dir = sidecar_dir / ".seed"
@@ -192,10 +199,7 @@ def _ensure_artifacts(sidecar_dir: Path, data_vmdk: Path, paths: HostPaths) -> N
     (seed_dir / "meta-data").write_text(meta_data(), encoding="utf-8")
 
     with Container(((sidecar_dir, "/work"),), paths=paths) as container:
-        base = ensure_base_image(
-            sidecar_dir, container, container_cache="/work", seed_dir=seed_dir
-        )
-        _force_nocloud(container, "/work", base.vmdk.name, seed_dir=seed_dir)
+        base = ensure_base_image(sidecar_dir, container, container_cache="/work", seed_dir=seed_dir)
         vmx = sidecar_dir / "sidecar.vmx"
         if not vmx.is_file():
             spec = SidecarVmxSpec(

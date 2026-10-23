@@ -12,27 +12,29 @@ Phases, each gated before and asserted after (see :mod:`.gates`):
 The data VMDK is attached to the sidecar (1x footprint; VMware does the
 VMDK I/O natively). ``resize2fs`` runs detached and is watched with the
 package's stall contract: progress = ``/sys/class/block/<dev>/stat`` field 6
-(write sectors), an unreadable counter counts as frozen, and a stall or a
-hard stop is recoverable — resize2fs is journal-atomic, sgdisk is re-runnable,
-zerofree is idempotent. Completed phases are recorded in ``state.json`` so a
-rerun resumes instead of restarting.
+(write sectors), and an unreadable counter counts as frozen. Interrupted
+mutations require manual assessment; completed phases in ``state.json`` are
+checkpoints, not a guarantee that a failed operation can safely be retried.
 """
 
 from __future__ import annotations
 
 import json
+import ntpath
+import re
 import shlex
 import subprocess
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Protocol
+from typing import Protocol, cast
 
 from ..console import err, info, ok, step, warn
 from ..container import Container
-from ..executor import ExecResult
-from ..fsops import parse_free_ranges
+from ..executor import ExecResult, Executor
+from ..fsops import FsError, check_fs, parse_free_ranges, recreate_partition, relocate_gpt_backup
 from ..graintrim import merge_ranges
 from ..paths import DEFAULT_PATHS, HostPaths
 from ..progress import PhaseBar
@@ -40,7 +42,7 @@ from . import gates
 from .discover import vmnet8_subnet, wait_for_guest_ip
 from .gates import GateError
 from .image import ensure_base_image
-from .seed import SEED_USER, build_seed_iso, generate_keypair, meta_data, user_data
+from .seed import SEED_USER, generate_keypair, meta_data, user_data
 from .ssh import GuestRunner, SshConfig, SshError, SshRunner
 from .vmx import SidecarVmxSpec
 
@@ -73,6 +75,42 @@ class Vmrun(Protocol):
     def is_running(self, vmx: Path) -> bool: ...
 
 
+@contextmanager
+def sidecar_lifecycle(sidecar_dir: Path, vmrun: Vmrun) -> Iterator[None]:
+    """Exclude other sidecar calls until poweroff has been positively verified."""
+    sidecar_dir = sidecar_dir.resolve()
+    sidecar_dir.mkdir(parents=True, exist_ok=True)
+    lock = sidecar_dir / ".lifecycle.lock"
+    guidance = (
+        f"sidecar lifecycle lock retained: {lock}; manual recovery required: "
+        "confirm no sidecar operation or VM is active, verify image mounts/NBD "
+        "connections are released, and assess any interrupted disk mutation "
+        "before manually removing this lock; do not delete the sidecar directory"
+    )
+    try:
+        lock.mkdir()
+    except FileExistsError as exc:
+        raise SidecarError(f"sidecar operation active or interrupted; {guidance}") from exc
+    failure: BaseException | None = None
+    try:
+        yield
+    except BaseException as exc:
+        failure = exc
+        raise
+    finally:
+        try:
+            stopped = not vmrun.is_running(sidecar_dir / "sidecar.vmx")
+        except Exception:  # noqa: BLE001 - an unknown power state must retain the lock
+            stopped = False
+        if stopped and not (sidecar_dir / ".image-prep.lock").exists():
+            lock.rmdir()
+        elif failure is not None:
+            failure.add_note(guidance)
+            warn(guidance)
+        else:
+            raise SidecarError(guidance)
+
+
 @dataclass(frozen=True)
 class SidecarPlan:
     """Inputs decided before the sidecar boots."""
@@ -98,7 +136,7 @@ class SidecarResult:
 
 @dataclass
 class _State:
-    """Resume tokens: completed phases plus values pinned by earlier phases."""
+    """Phase checkpoints plus values pinned by earlier phases."""
 
     done: list[str]
     fs_end_sector: int | None = None
@@ -173,9 +211,16 @@ class RealVmrun:
         """Running state via ``vmrun list`` (getGuestState is not in this
         Workstation's vmrun); tools state via ``checkToolsState``."""
         result = self._run("list")
-        target = str(vmx.resolve()).lower()
-        for line in result.output.splitlines()[1:]:
-            if line.strip().lower() == target:
+        lines = result.output.strip().splitlines()
+        header = re.fullmatch(r"Total running VMs:\s*(\d+)", lines[0]) if lines else None
+        if header is None or int(header.group(1)) != len(lines) - 1:
+            raise SidecarError("cannot verify running VMs: malformed vmrun list output")
+        target = ntpath.normcase(ntpath.normpath(str(vmx.resolve())))
+        for line in lines[1:]:
+            path = line.strip()
+            if not ntpath.isabs(path) or not path.lower().endswith(".vmx"):
+                raise SidecarError("cannot verify running VMs: invalid VMX path in vmrun list")
+            if ntpath.normcase(ntpath.normpath(path)) == target:
                 return "The VM is running"
         return "The VM is not running"
 
@@ -300,7 +345,7 @@ class SidecarOrchestrator:
         self.paths = paths
         self.vmrun = RealVmrun(paths)
         self.state_path = plan.sidecar_dir / "state.json"
-        self._state = _State.load(self.state_path)
+        self._state = _State(done=[])
 
     # -- small helpers ---------------------------------------------------
     def _mark(self, phase: str) -> None:
@@ -322,6 +367,27 @@ class SidecarOrchestrator:
         resize_total_bytes: int = 0,
         zerofree_total_bytes: int = 0,
     ) -> SidecarResult:
+        with sidecar_lifecycle(self.plan.sidecar_dir, self.vmrun):
+            self._state = _State.load(self.state_path)
+            mutation_phases = {"mutation-started", "resize", "partition", "free-map", "zerofree"}
+            if mutation_phases.intersection(self._state.done) and not self._done("done"):
+                raise SidecarError(
+                    "interrupted sidecar mutation requires manual assessment; "
+                    "automatic mutation retries are disabled; preserve state.json and the disk"
+                )
+            return self._run_locked(
+                bar=bar,
+                resize_total_bytes=resize_total_bytes,
+                zerofree_total_bytes=zerofree_total_bytes,
+            )
+
+    def _run_locked(
+        self,
+        *,
+        bar: PhaseBar | None = None,
+        resize_total_bytes: int = 0,
+        zerofree_total_bytes: int = 0,
+    ) -> SidecarResult:
         plan = self.plan
         step(
             f"Sidecar mode: shrink [val]{plan.data_vmdk.name}[/val] to "
@@ -330,11 +396,13 @@ class SidecarOrchestrator:
         gates.require_no_locks(plan.vm_dir)
         gates.require_free_space(plan.sidecar_dir, 5)
 
+        vmx = plan.sidecar_dir / "sidecar.vmx"
+        if self.vmrun.is_running(vmx):
+            raise GateError("sidecar VM is already running; stop it before preparing artifacts")
         state = self._state
         if not self._done("image") or not self._done("seed") or not self._done("vmx"):
             self._build_artifacts()
-        vmx = plan.sidecar_dir / "sidecar.vmx"
-        if not self._done("all"):
+        if not self._done("done"):
             self._boot_and_operate(
                 vmx,
                 bar=bar,
@@ -372,10 +440,6 @@ class SidecarOrchestrator:
                 )
                 spec.write(plan.sidecar_dir / "sidecar.vmx")
                 self._mark("vmx")
-            if not self._done("seed"):
-                pair = generate_keypair(plan.sidecar_dir)
-                build_seed_iso(plan.sidecar_dir, pair, container, container_seed="/work")
-                self._mark("seed")
             if not self._done("image"):
                 self._mark("image")  # verified/converted above
 
@@ -394,11 +458,12 @@ class SidecarOrchestrator:
         if vmrun.is_running(vmx):
             raise GateError(
                 "sidecar VM is already running — a previous cycle may be active; "
-                "stop it first or delete the sidecar directory to rebuild"
+                "manual shutdown and assessment required; preserve the sidecar directory"
             )
         step("Booting sidecar VM")
-        vmrun.start(vmx)
+        runner: GuestRunner | None = None
         try:
+            vmrun.start(vmx)
             subnet = vmnet8_subnet()
             ip = wait_for_guest_ip(vmx, subnet=subnet, attempts=40, delay_s=15.0)
             info(f"sidecar IP: [val]{ip}[/val] (NAT {subnet})")
@@ -409,7 +474,7 @@ class SidecarOrchestrator:
                 key=pair_key,
                 known_hosts=plan.sidecar_dir / "known_hosts",
             )
-            runner: GuestRunner = _SudoRunner(SshRunner(config))
+            runner = _SudoRunner(SshRunner(config))
             gates.wait_ssh_ready(runner, attempts=SSH_WAIT_ATTEMPTS, delay_s=SSH_WAIT_DELAY_S)
             step("Waiting for cloud-init to finish")
             ci = runner.run("cloud-init status --wait", timeout=CLOUD_INIT_TIMEOUT, check=False)
@@ -424,6 +489,7 @@ class SidecarOrchestrator:
                 raise GateError(f"cannot derive parent device from {partition}")
             info(f"data partition identified: [val]{partition}[/val] on [val]{device}[/val]")
 
+            self._mark("mutation-started")
             self._run_fs_phases(
                 runner,
                 partition,
@@ -437,16 +503,11 @@ class SidecarOrchestrator:
             self._mark("done")
         except Exception:
             err(
-                "sidecar cycle failed — powering the sidecar off (data fs is journaled; "
-                "resize2fs resumes; rerun with the same command to continue)"
+                "sidecar cycle failed — powering the sidecar off; "
+                "interrupted disk mutations require manual assessment, not an automatic retry"
             )
             try:
-                if self.vmrun.is_running(vmx):
-                    try:
-                        self.vmrun.stop(vmx)
-                    except SidecarError:
-                        warn("graceful poweroff failed; falling back to stop hard")
-                        self.vmrun.stop(vmx, hard=True)
+                shutdown_sidecar(self.vmrun, vmx, runner)
             except SidecarError:
                 warn("could not power off sidecar via vmrun; stop it manually")
             raise
@@ -469,8 +530,15 @@ class SidecarOrchestrator:
         log_file = "/run/vmdk-shrink.log"
 
         gates.require_unmounted(runner, partition)
+        recreate_partition(
+            cast(Executor, runner),
+            device,
+            start_lba=plan.start_lba,
+            end_lba=end_lba,
+            validate_only=True,
+        )
         step(f"e2fsck -fy on {partition}")
-        runner.run(f"/usr/sbin/e2fsck -fy '{partition}'", timeout=4 * 3600.0)
+        check_fs(cast(Executor, runner), partition, fix=True)
 
         if not self._done("resize"):
             step(f"resize2fs to [val]{plan.target_gib} GiB[/val] (watched)")
@@ -495,10 +563,10 @@ class SidecarOrchestrator:
                     bar.finish()
             self._mark("resize")
         else:
-            info("resize phase already complete (resume)")
+            info("resize phase recorded complete")
 
         step("post-resize fsck")
-        runner.run(f"/usr/sbin/e2fsck -fy '{partition}'", timeout=4 * 3600.0)
+        check_fs(cast(Executor, runner), partition, fix=True)
         gates.assert_block_count(runner, partition, expected_blocks, plan.block_size)
         fs_end = plan.start_lba + expected_blocks * (plan.block_size // SECTOR) - 1
         self._state.fs_end_sector = fs_end
@@ -506,26 +574,23 @@ class SidecarOrchestrator:
 
         if not self._done("partition"):
             step(f"Recreating partition 1: [{plan.start_lba}, {end_lba}]")
-            runner.run(
-                f"/usr/sbin/sgdisk -d 1 '{device}' && /usr/sbin/sgdisk -a 1 "
-                f"-n 1:{plan.start_lba}:{end_lba} -t 1:8300 '{device}' && "
-                f"/usr/sbin/sgdisk -e '{device}'",
-                timeout=600.0,
+            # These shared operations use only run(), not Executor.run_detached().
+            recreate_partition(
+                cast(Executor, runner), device, start_lba=plan.start_lba, end_lba=end_lba
             )
+            relocate_gpt_backup(cast(Executor, runner), device)
             gates.assert_partition_layout(runner, device, plan.start_lba, end_lba)
             self._mark("partition")
         else:
-            info("partition phase already complete (resume)")
+            info("partition phase recorded complete")
 
         gates.require_unmounted(runner, partition)
         if not self._done("free-map"):
             step("free-space map (dumpe2fs, in guest)")
             try:
-                out = runner.run(
-                    f"/usr/sbin/dumpe2fs '{partition}'", timeout=600.0
-                ).output
+                out = runner.run(f"/usr/sbin/dumpe2fs '{partition}'", timeout=600.0).output
                 ranges = merge_ranges(parse_free_ranges(out))
-            except Exception as exc:  # noqa: BLE001 - fall back to zero-writes
+            except (SshError, FsError, ValueError) as exc:
                 ranges = []
                 warn(f"free-map collection failed ({exc}); falling back to zerofree")
                 self._run_zerofree(runner, partition, device, bar, zerofree_total_bytes)
@@ -533,7 +598,7 @@ class SidecarOrchestrator:
                 self._state.free_ranges = [[a, b] for a, b in ranges]
             self._mark("free-map")
         else:
-            info("free-map phase already complete (resume)")
+            info("free-map phase recorded complete")
 
         runner.run("sync", timeout=300.0)
 
@@ -547,7 +612,7 @@ class SidecarOrchestrator:
     ) -> None:
         """Legacy fallback: zero free blocks in-guest (slower, writes data)."""
         if self._done("zerofree"):
-            info("zerofree phase already complete (resume)")
+            info("zerofree phase recorded complete")
             return
         step("zerofree (watched)")
         if bar is not None:
@@ -572,19 +637,40 @@ class SidecarOrchestrator:
         self._mark("zerofree")
 
     def _shutdown(self, runner: GuestRunner, vmx: Path) -> None:
-        step("Powering sidecar off (graceful)")
-        runner.run("systemctl poweroff --no-wall", timeout=60, check=False)
+        shutdown_sidecar(self.vmrun, vmx, runner)
+
+
+def shutdown_sidecar(vmrun: Vmrun, vmx: Path, runner: GuestRunner | None = None) -> None:
+    """Request guest poweroff without VMware Tools, then verify release of the VM."""
+    step("Powering sidecar off (graceful)")
+    if not vmrun.is_running(vmx):
+        return
+    graceful = False
+    try:
+        if runner is not None:
+            runner.run("systemctl poweroff --no-wall", timeout=60, check=False)
+        else:
+            vmrun.stop(vmx)
+        graceful = True
+    except (SidecarError, SshError):
+        warn("graceful poweroff unavailable; verifying state before hard stop")
+    if graceful:
         deadline = time.monotonic() + POWER_OFF_TIMEOUT_S
         while time.monotonic() < deadline:
-            if not self.vmrun.is_running(vmx):
+            if not vmrun.is_running(vmx):
                 ok("sidecar powered off")
                 return
             time.sleep(5)
-        warn("graceful poweroff timed out; hard-stopping (all guest writes already synced)")
-        self.vmrun.stop(vmx, hard=True)
-        if self.vmrun.is_running(vmx):
+    if not vmrun.is_running(vmx):
+        return
+    warn("hard-stopping sidecar; poweroff must be confirmed before continuing")
+    vmrun.stop(vmx, hard=True)
+    deadline = time.monotonic() + POWER_OFF_TIMEOUT_S
+    while vmrun.is_running(vmx):
+        if time.monotonic() >= deadline:
             raise SidecarError("sidecar did not power off even after hard stop")
-        ok("sidecar hard-stopped")
+        time.sleep(5)
+    ok("sidecar hard-stopped")
 
 
 def run_sidecar_fs_phase(

@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .console import info, step
-from .executor import Executor
+from .executor import ExecError, Executor
 from .fsops import free_block_ranges, fs_facts
 from .graintrim import TrimStats, fs_blocks_to_sectors, trim_free_grains
 from .nbd import NbdDisk
@@ -59,10 +59,8 @@ def collect_free_map(ex: Executor, disk: NbdDisk, *, partition: int = 1) -> Free
             timeout=30,
         ).output.strip()
         start = int(out)
-    except Exception as exc:  # noqa: BLE001 - any geometry failure means fallback
-        raise TrimUnavailable(
-            f"cannot map {disk.device} partition {partition}: {exc}"
-        ) from exc
+    except (ExecError, ValueError) as exc:
+        raise TrimUnavailable(f"cannot map {disk.device} partition {partition}: {exc}") from exc
     part = disk.partition(partition)
     facts = fs_facts(ex, part)
     ranges = free_block_ranges(ex, part)

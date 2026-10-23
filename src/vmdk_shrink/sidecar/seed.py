@@ -1,4 +1,4 @@
-"""cloud-init NoCloud seed: an ephemeral SSH keypair plus a ``cidata`` ISO.
+"""cloud-init NoCloud seed: an ephemeral SSH keypair and on-disk configuration.
 
 The seed configures boot plumbing *only* — an SSH key, passwordless sudo for
 the image's default user, and nothing else. No operational command ever runs
@@ -15,8 +15,7 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
-from ..console import info, ok, step
-from ..executor import ExecError, Executor
+from ..console import info, ok
 
 SEED_USER = "debian"
 
@@ -89,7 +88,10 @@ def user_data(public_key: str) -> str:
         "packages:\n"
         "  - zerofree\n"
         "  - gdisk\n"
-        "  - parted\n"
+        "  - fdisk\n"
+        "  - e2fsprogs\n"
+        "  - util-linux\n"
+        "  - coreutils\n"
         'final_message: "vmdk-shrink sidecar ready after $UPTIME seconds"\n'
     )
 
@@ -116,46 +118,6 @@ def network_config(mac: str) -> str:
         "    dhcp6: false\n"
         "    optional: true\n"
     )
-
-
-def build_seed_iso(
-    seed_dir: Path, pair: Keypair, ex: Executor, container_seed: str, guest_mac: str = ""
-) -> Path:
-    """Write the seed files and build ``cidata`` ISO9660 inside the container.
-
-    ``ex`` must see *seed_dir* at *container_seed*. ``genisoimage`` is installed
-    on demand (the packaged Dockerfile also pre-installs it).
-    """
-    seed_dir.mkdir(parents=True, exist_ok=True)
-    ud = seed_dir / "user-data"
-    md = seed_dir / "meta-data"
-    nc = seed_dir / "network-config"
-    iso = seed_dir / "sidecar-seed.iso"
-    ud.write_text(user_data(pair.public_key), encoding="utf-8")
-    md.write_text(meta_data(fresh_instance_id()), encoding="utf-8")
-    if guest_mac:
-        nc.write_text(network_config(guest_mac), encoding="utf-8")
-        files = (
-            f"{container_seed}/user-data {container_seed}/meta-data {container_seed}/network-config"
-        )
-    else:
-        files = f"{container_seed}/user-data {container_seed}/meta-data"
-
-    step("Building NoCloud seed ISO (in container)")
-    cmd = (
-        f"sh -c 'command -v genisoimage >/dev/null || {{ apt-get update -qq && "
-        f"apt-get install -y -qq --no-install-recommends genisoimage; }} && "
-        f"genisoimage -quiet -output {container_seed}/sidecar-seed.iso -volid cidata "
-        f"-joliet -rock {files}'"
-    )
-    try:
-        result = ex.run(cmd, timeout=600)
-    except ExecError as exc:
-        raise SeedError(f"seed ISO build failed: {exc}") from exc
-    if result.exit_code != 0 or not iso.is_file():
-        raise SeedError(f"seed ISO build failed: {result.output}")
-    ok(f"seed ISO: {iso.name} ({iso.stat().st_size / 1024:.0f} KiB)")
-    return iso
 
 
 def fresh_instance_id() -> str:

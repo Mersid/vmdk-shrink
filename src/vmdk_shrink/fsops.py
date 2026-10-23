@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import re
+import shlex
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -24,14 +25,7 @@ class FsError(RuntimeError):
 
 
 class StallError(FsError):
-    """A watched phase made no I/O progress for too long.
-
-    Root cause is the vp9fs.dll Tflush race (microsoft/WSL#41702): Docker's
-    drvfs layer occasionally loses a request's completion, and everything
-    queued behind it wedges. Recovery is a fresh container (a new 9p session
-    works immediately); no ``wsl --shutdown`` needed unless the whole mount
-    dies.
-    """
+    """A watched, explicitly retry-safe phase made no progress for too long."""
 
 
 @dataclass(frozen=True)
@@ -97,7 +91,9 @@ def partition_geometry(ex: Executor, disk: str, number: int = 1) -> PartitionGeo
 def check_fs(
     ex: Executor, partition_path: str, *, fix: bool = False, bar: PhaseBar | None = None
 ) -> str:
-    """Run e2fsck; exits 0/1/2 are success (1 = errors corrected, 2 = +reboot).
+    """Run e2fsck; read-only checks require exit 0 (a clean filesystem).
+
+    Repair mode also accepts exits 1/2 (errors corrected, reboot required).
 
     With *bar*, the five e2fsck passes drive a 5-step display via streaming
     output instead of one blocking call.
@@ -109,15 +105,18 @@ def check_fs(
         seen = 0
         started = False
         progress_bar = bar
+        pending = ""
 
         def _on_chunk(chunk: str) -> object:
-            nonlocal seen, started
-            m = re.search(r"Pass (\d+)", chunk)
-            if not m:
+            nonlocal seen, started, pending
+            pending += chunk
+            matches = re.findall(r"Pass (\d+)", pending)
+            pending = pending[-16:]
+            if not matches:
                 return None
-            current = int(m.group(1))
+            current = max(int(n) for n in matches)
             if not started:
-                progress_bar.start_files("e2fsck", 5)
+                progress_bar.start_steps("e2fsck", 5)
                 started = True
             if current > seen:
                 progress_bar.bump_files(current - seen)
@@ -125,11 +124,14 @@ def check_fs(
             return None
 
         result = ex.stream(f"e2fsck {flag} {partition_path}", timeout=14400, chunk_cb=_on_chunk)
-        bar.finish()
 
-    if result.exit_code not in (0, 1, 2):
+    success = result.exit_code in ((0, 1, 2) if fix else (0,))
+    if bar is not None:
+        bar.finish(success=success)
+    if not success:
+        reason = "uncorrected errors" if fix else "read-only check requires a clean filesystem"
         raise FsError(
-            f"e2fsck failed (exit {result.exit_code}, uncorrected errors):\n{result.output[-2000:]}"
+            f"e2fsck failed (exit {result.exit_code}, {reason}):\n{result.output[-2000:]}"
         )
     return result.output
 
@@ -145,20 +147,86 @@ def recreate_partition(
     *,
     start_lba: int,
     end_lba: int,
-    typecode: str = "8300",
+    typecode: str | None = None,
     number: int = 1,
+    validate_only: bool = False,
 ) -> None:
-    """Delete and recreate the partition at the EXACT original start LBA.
+    """Shrink a GPT entry without changing its identity or its start sector.
 
-    sgdisk's default 2048-sector alignment would move the start and the ext4
-    superblock would no longer be found ("Bad magic number"). ``-a 1`` disables
-    alignment so the start stays put.
+    All metadata is read and validated before one sgdisk invocation writes
+    the table. This is not crash-atomic; interruption requires manual recovery.
+    ``typecode`` is retained for compatibility but cannot override the GPT type.
+    ``validate_only`` performs the same checks without writing the table.
     """
-    ex.run(f"sgdisk --delete={number} {disk}", timeout=120)
-    ex.run(
-        f"sgdisk -a 1 --new={number}:{start_lba}:{end_lba} --typecode={number}:{typecode} {disk}",
-        timeout=120,
-    )
+    if number < 1 or start_lba < 1 or end_lba < start_lba:
+        raise FsError("invalid partition geometry")
+    quoted_disk = shlex.quote(disk)
+    scan = ex.run(f"gdisk -l {quoted_disk}", timeout=60).output
+    if not (
+        re.search(r"(?m)^\s*MBR: protective\s*$", scan)
+        and re.search(r"(?m)^\s*GPT: present\s*$", scan)
+    ) or re.search(r"(?i)\b(hybrid|invalid|corrupt|warning|caution)\b", scan):
+        raise FsError("only intact native GPT with a protective MBR is supported")
+    try:
+        table = json.loads(ex.run(f"sfdisk --json {quoted_disk}", timeout=60).output)[
+            "partitiontable"
+        ]
+        if table["label"] != "gpt":
+            raise FsError("only native GPT partition tables are supported")
+        node = f"{disk}{'p' if disk[-1].isdigit() else ''}{number}"
+        partitions = table["partitions"]
+        matches = [p for p in partitions if p["node"] == node]
+        if len(matches) != 1:
+            raise FsError(f"partition {number} not uniquely identified on {disk}")
+        part = matches[0]
+        old_start = int(part["start"])
+        old_end = old_start + int(part["size"]) - 1
+        if not (
+            table["unit"] == "sectors"
+            and int(table["sectorsize"]) in (512, 4096)
+            and int(table["firstlba"]) <= start_lba == old_start
+            and end_lba <= old_end <= int(table["lastlba"])
+        ):
+            raise FsError(
+                "invalid partition geometry: only shrinking at the original start is safe"
+            )
+        for other in partitions:
+            if other is part:
+                continue
+            lo = int(other["start"])
+            hi = lo + int(other["size"]) - 1
+            if lo <= old_end and hi >= old_start:
+                raise FsError("overlapping partition geometry")
+        guid_pattern = r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}"
+        for key in ("type", "uuid"):
+            if not re.fullmatch(guid_pattern, part[key]):
+                raise FsError(f"invalid GPT {key} GUID")
+        if typecode is not None and typecode.lower() != part["type"].lower():
+            raise FsError("partition type override would change the original GPT type GUID")
+        name = part.get("name", "")
+        if not isinstance(name, str) or "\0" in name:
+            raise FsError("invalid GPT partition name")
+    except (KeyError, TypeError, ValueError, IndexError) as exc:
+        raise FsError("cannot validate GPT partition metadata") from exc
+    info = ex.run(f"sgdisk --info={number} {quoted_disk}", timeout=60).output
+    # sgdisk reports a hybrid MBR here; never allow its implicit conversion.
+    if re.search(r"\b(hybrid|MBR only|converting)\b", info, re.IGNORECASE):
+        raise FsError("unsupported hybrid or converted partition table")
+    attributes = _capture(info, r"(?m)^Attribute flags: ([0-9a-fA-F]{16})\s*$")
+    args = [
+        "sgdisk",
+        "-a",
+        "1",
+        f"--delete={number}",
+        f"--new={number}:{start_lba}:{end_lba}",
+        f"--typecode={number}:{part['type']}",
+        f"--partition-guid={number}:{part['uuid']}",
+        f"--change-name={number}:{name}",
+        f"--attributes={number}:=:0x{attributes}",
+        disk,
+    ]
+    if not validate_only:
+        ex.run(shlex.join(args), timeout=120)
 
 
 def relocate_gpt_backup(ex: Executor, disk: str) -> str:
@@ -188,11 +256,10 @@ def parse_free_ranges(text: str) -> list[tuple[int, int]]:
         stripped = line.strip()
         if not stripped.startswith("Free blocks:"):
             continue
-        # Summary line ("Free blocks:              454735") vs per-group
-        # ranges ("Free blocks: 8615-32767, 33025-33279").
-        body = stripped[len("Free blocks:") :].strip()
-        if "-" not in body:
+        # Group lists are indented; the unindented header is only a count.
+        if line == line.lstrip():
             continue
+        body = stripped[len("Free blocks:") :].strip()
         for part in body.split(","):
             part = part.strip()
             if not part:
@@ -202,6 +269,8 @@ def parse_free_ranges(text: str) -> list[tuple[int, int]]:
                 lo, hi = int(first), int(last or first)
             except ValueError as exc:
                 raise FsError(f"cannot parse free-block range {part!r}") from exc
+            if lo < 0 or hi < lo:
+                raise FsError(f"invalid free-block range {part!r}")
             ranges.append((lo, hi))
     return ranges
 
@@ -229,21 +298,34 @@ def run_watched(
     max_runtime_s: float,
     interval_s: float = 300.0,
     stall_limit: int = 3,
+    retry_safe: bool = False,
 ) -> str:
-    """Run a long phase detached and poll its progress; raise :class:`StallError`.
+    """Run a long phase detached and poll its progress.
 
     The command runs via ``docker exec -d`` so a wedged drvfs connection can
     never hang the control plane — the polls read local container files only.
     Completion is detected through an ``EXIT=<n>`` marker the wrapper appends
-    to the log, so a crashed phase is told apart from a finished one.
+    to the log, so a crashed phase is told apart from a finished one. A timeout
+    does not stop the command or prove a resize can be resumed. By default
+    interruptions raise FsError, not the retryable StallError.
     """
+
+    def interrupted(message: str) -> FsError:
+        if retry_safe:
+            return StallError(message)
+        return FsError(
+            f"{message}; operation may still be running or interrupted; "
+            "manual recovery required, do not automatically retry"
+        )
+
     log = f"/tmp/{phase}.log"
     ex.run_detached(f"( {command}; echo EXIT=$? ) > {log} 2>&1")
     deadline = time.monotonic() + max_runtime_s
+    next_progress = time.monotonic() + interval_s
     frozen = 0
     last = progress()
     while time.monotonic() < deadline:
-        time.sleep(interval_s)
+        time.sleep(max(0, min(5.0, interval_s, deadline - time.monotonic())))
         tail = ex.run(f"cat {log}", timeout=30, check=False).output
         if "EXIT=" in tail:
             marker = tail.rsplit("EXIT=", 1)[1].split()[0]
@@ -254,6 +336,9 @@ def run_watched(
             if code != 0:
                 raise FsError(f"{phase} failed (exit {code}):\n{tail[-2000:]}")
             return tail
+        if time.monotonic() < next_progress:
+            continue
+        next_progress = time.monotonic() + interval_s
         now = progress()
         if now < 0:
             # Unreadable counter — the control plane (docker engine/exec) itself
@@ -265,7 +350,7 @@ def run_watched(
                 f"(engine wedged?); log tail: {tail.strip()[-300:] or '<empty>'}"
             )
             if frozen >= stall_limit:
-                raise StallError(
+                raise interrupted(
                     f"{phase}: control plane unreadable for "
                     f"{stall_limit * interval_s / 60:.0f} min; "
                     f"log tail: {tail.strip()[-500:] or '<empty>'}"
@@ -277,18 +362,22 @@ def run_watched(
                 f"log tail: {tail.strip()[-300:] or '<empty>'}"
             )
             if frozen >= stall_limit:
-                raise StallError(
+                raise interrupted(
                     f"{phase}: no I/O progress for {stall_limit * interval_s / 60:.0f} min; "
                     f"log tail: {tail.strip()[-500:] or '<empty>'}"
                 )
         else:
             frozen = 0
         last = now
-    raise StallError(f"{phase}: exceeded the {max_runtime_s / 60:.0f} min runtime limit")
+    raise interrupted(f"{phase}: exceeded the {max_runtime_s / 60:.0f} min runtime limit")
 
 
 def mount_ro(ex: Executor, partition_path: str, mount: str = "/mnt/data") -> None:
-    ex.run(f"mkdir -p {mount} && mount -o ro {partition_path} {mount}", timeout=120)
+    ex.run(
+        f"mkdir -p {shlex.quote(mount)} && mount -o ro,noload "
+        f"{shlex.quote(partition_path)} {shlex.quote(mount)}",
+        timeout=120,
+    )
 
 
 def unmount(ex: Executor, mount: str = "/mnt/data") -> None:

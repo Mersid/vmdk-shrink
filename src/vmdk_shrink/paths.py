@@ -1,9 +1,4 @@
-"""Locations of host-side tools.
-
-Only Docker (plus optionally ``wsl`` to load the NBD module into Docker
-Desktop's kernel) and VMware's ``vmware-vdiskmanager`` are needed on the host;
-everything else lives in the container image.
-"""
+"""Host executable locations. Command-specific requirements live in prerequisites."""
 
 from __future__ import annotations
 

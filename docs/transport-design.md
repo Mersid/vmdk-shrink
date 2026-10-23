@@ -1,5 +1,10 @@
 # Transport design: why the VMDK is converted to VHDX before filesystem surgery
 
+> Historical experiment record, not the current implementation or safety contract.
+> The current tool does not automatically convert to VHDX or vendor host QEMU.
+> See `architecture.md` and the root README for supported paths and requirements.
+> Claims below about journal repair do not establish crash-safe data recovery.
+
 This document records an architecture decision that cost several days of
 measurement and debugging to arrive at. Read this before proposing to
 "just shim the VMDK" — every alternative below was tried or measured.

@@ -1,5 +1,10 @@
 # Hash transport benchmark (2026-10-21)
 
+> Historical measurements and former defaults. Current defaults deliberately avoid
+> mixing runtimes: hashing follows `shrink --mode`; standalone hash uses container.
+> There is no shipped TCP-NBD backend or required vendored host QEMU. See
+> `architecture.md`; timings below are not verification evidence for the new code.
+
 Goal: pick the fastest way to produce per-file SHA-256 manifests for verification
 without shipping data off-box (no cloud VMs) and without bespoke filesystem code.
 All candidates read the same fixture (`trimfix`, 2 GiB ext4, 100 × 2 MiB files)

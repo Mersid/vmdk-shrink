@@ -14,26 +14,35 @@ from __future__ import annotations
 import threading
 import time
 from collections.abc import Callable
+from functools import wraps
 from types import TracebackType
+from typing import Any
 
 from rich.console import Console
 from rich.progress import (
     BarColumn,
-    FileSizeColumn,
-    MofNCompleteColumn,
     Progress,
     TaskID,
     TaskProgressColumn,
     TextColumn,
     TimeElapsedColumn,
     TimeRemainingColumn,
-    TransferSpeedColumn,
 )
 
 from .console import console as _console
+from .presentation import PhaseMetricsColumn
 
 SECTOR = 512
 _POLL_INTERVAL_S = 5.0
+
+
+def managed_bar(function: Any) -> Any:
+    @wraps(function)
+    def render(*args: Any, **kwargs: Any) -> Any:
+        with PhaseBar() as bar:
+            return function(*args, **kwargs, _bar=bar)
+
+    return render
 
 
 class PhaseBar:
@@ -54,9 +63,7 @@ class PhaseBar:
             TextColumn("[info]{task.description}[/info]"),
             BarColumn(style="dim white", complete_style="cyan", finished_style="bright_cyan"),
             TaskProgressColumn(),
-            MofNCompleteColumn(),
-            FileSizeColumn(),
-            TransferSpeedColumn(),
+            PhaseMetricsColumn(),
             TimeElapsedColumn(),
             TimeRemainingColumn(),
             speed_estimate_period=120.0,
@@ -95,32 +102,36 @@ class PhaseBar:
         """Begin a files-unit phase (manifest hashing)."""
         self._begin(phase, total=total_files, files=True)
 
+    def start_steps(self, phase: str, total_steps: int) -> None:
+        self._begin(phase, total=max(total_steps, 1), files=True, unit="steps")
+
     def start_bytes(self, phase: str, total_bytes: int, sampler: Callable[[], int]) -> None:
         """Begin a bytes-unit phase; *sampler* returns written 512-B sectors."""
         self._begin(phase, total=max(total_bytes, 1), files=False)
         self._total_bytes = max(total_bytes, 1)
-        self._start_ticker(sampler)
+        initial = sampler()
+        self._start_ticker(lambda: max(0, sampler() - initial) if initial >= 0 else -1)
 
     def bump_files(self, count: int = 1) -> None:
         if self._task is not None and self._unit_files:
             self._progress.advance(self._task, count)
 
-    def finish(self) -> None:
-        """Snap the bar to completion (phase exited; percentages may lag)."""
+    def finish(self, *, success: bool = True) -> None:
+        """Only successful phases snap to completion; estimates may lag actual work."""
         if self._task is None:
             return
         self._stop_ticker()
         task = self._progress.tasks[self._task]
-        if task.total is not None:
+        if success and task.total is not None:
             self._progress.update(self._task, completed=task.total)
         self._progress.update(self._task, visible=False)
         self._task = None
 
     # ----------------------------------------------------------- private ----
-    def _begin(self, phase: str, *, total: int, files: bool) -> None:
+    def _begin(self, phase: str, *, total: int, files: bool, unit: str | None = None) -> None:
         self._ensure_entered()
         self.finish()  # close any previous phase's task
-        self._task = self._progress.add_task(phase, total=total)
+        self._task = self._progress.add_task(phase, total=total, files=files, unit=unit)
         self._unit_files = files
 
     def _ensure_entered(self) -> None:
@@ -129,18 +140,21 @@ class PhaseBar:
             self._entered = True
 
     def _start_ticker(self, sampler: Callable[[], int]) -> None:
-        self._stop.clear()
+        self._stop = threading.Event()
+        stop = self._stop
+        task = self._task
+        total = self._total_bytes
 
         def _tick() -> None:
-            while not self._stop.wait(self._poll_interval_s):
+            while not stop.wait(self._poll_interval_s):
                 try:
                     sectors = sampler()
                 except Exception:  # noqa: BLE001 - display must never kill a phase
                     continue
-                if self._task is None or sectors < 0:
+                if task is None or stop.is_set() or task != self._task or sectors < 0:
                     continue  # unreadable counter: skip, the watchdog handles stalls
                 written = sectors * SECTOR
-                self._progress.update(self._task, completed=min(written, self._total_bytes))
+                self._progress.update(task, completed=min(written, total))
 
         self._ticker = threading.Thread(target=_tick, daemon=True)
         ticker = self._ticker

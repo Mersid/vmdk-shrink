@@ -10,12 +10,17 @@ once and cached; every use re-verifies the SHA-512 against Debian's
 from __future__ import annotations
 
 import hashlib
+import shlex
 import urllib.request
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
+from typing import cast
 
 from ..console import info, ok, step
+from ..container import Container
 from ..executor import ExecError, Executor
+from ..nbd import NbdError, NbdSession
 
 SUITE = "trixie"
 FLAVOR = "genericcloud"
@@ -26,6 +31,10 @@ _CHUNK = 1024 * 1024
 
 class ImageError(RuntimeError):
     pass
+
+
+class ImageCleanupError(ImageError):
+    """The image may still be mounted; retain files and lock for manual recovery."""
 
 
 @dataclass(frozen=True)
@@ -87,42 +96,65 @@ def ensure_base_image(
     and sees *cache_dir* at *container_cache*.
     """
     cache_dir.mkdir(parents=True, exist_ok=True)
-    step(f"Resolving Debian {SUITE} {FLAVOR} image")
-    filename, sha512 = _resolve_image()
+    lock = cache_dir / ".image-prep.lock"
+    try:
+        lock.mkdir()
+    except FileExistsError as exc:
+        raise ImageError(
+            f"image preparation already active or interrupted: {lock}; "
+            "remove the lock only after confirming no preparation or sidecar VM is active"
+        ) from exc
+    temporary: list[Path] = []
+    cleanup_safe = True
+    try:
+        step(f"Resolving Debian {SUITE} {FLAVOR} image")
+        filename, sha512 = _resolve_image()
+        qcow2 = cache_dir / filename
+        if qcow2.is_file():
+            info(f"cached image found: {qcow2.name}")
+            _verified(qcow2, sha512, "cached qcow2")
+        else:
+            tmp = cache_dir / f"{filename}.{uuid.uuid4().hex}.part"
+            temporary.append(tmp)
+            step(f"Downloading [val]{filename}[/val] (about 0.5 GiB, once)")
+            actual = _download_streaming(f"{_BASE_URL}/{filename}", tmp)
+            if actual != sha512:
+                raise ImageError("downloaded image failed checksum")
+            tmp.replace(qcow2)
+            ok(f"downloaded and verified ({qcow2.stat().st_size / 2**30:.2f} GiB)")
 
-    qcow2 = cache_dir / filename
-    if qcow2.is_file():
-        info(f"cached image found: {qcow2.name}")
-        _verified(qcow2, sha512, "cached qcow2")
-    else:
-        tmp = cache_dir / (filename + ".part")
-        step(f"Downloading [val]{filename}[/val] (about 0.5 GiB, once)")
-        actual = _download_streaming(f"{_BASE_URL}/{filename}", tmp)
-        if actual != sha512:
-            tmp.unlink(missing_ok=True)
-            raise ImageError("downloaded image failed checksum")
-        tmp.replace(qcow2)
-        ok(f"downloaded and verified ({qcow2.stat().st_size / 2**30:.2f} GiB)")
-
-    vmdk = cache_dir / f"sidecar-base-{sha512[:12]}.vmdk"
-    if vmdk.is_file():
-        info(f"cached conversion: {vmdk.name}")
-    else:
-        step("Converting qcow2 -> monolithic-sparse VMDK (in container)")
-        cmd = (
-            f"qemu-img convert -O vmdk -o subformat=monolithicSparse "
-            f"'{container_cache}/{filename}' '{container_cache}/{vmdk.name}'"
-        )
-        try:
+        vmdk = cache_dir / f"sidecar-base-{sha512[:12]}.vmdk"
+        if vmdk.is_file():
+            info(f"cached conversion: {vmdk.name}")
+            _force_nocloud(ex, container_cache, vmdk.name, seed_dir=seed_dir)
+        else:
+            step("Converting qcow2 -> monolithic-sparse VMDK (in container)")
+            pending = cache_dir / f"{vmdk.stem}.{uuid.uuid4().hex}.part.vmdk"
+            temporary.append(pending)
+            cmd = (
+                "qemu-img convert -O vmdk -o subformat=monolithicSparse "
+                f"{shlex.quote(f'{container_cache}/{filename}')} "
+                f"{shlex.quote(f'{container_cache}/{pending.name}')}"
+            )
             result = ex.run(cmd, timeout=900)
-        except ExecError as exc:
-            raise ImageError(f"qemu-img conversion failed: {exc}") from exc
-        if result.exit_code != 0:
-            raise ImageError(f"qemu-img conversion failed: {result.output}")
-        _force_nocloud(ex, container_cache, vmdk.name, seed_dir=seed_dir)
-        ok(f"converted: {vmdk.stat().st_size / 2**30:.2f} GiB host")
-
-    return BaseImage(qcow2=qcow2, vmdk=vmdk, sha512=sha512)
+            if result.exit_code != 0:
+                raise ImageError(f"qemu-img conversion failed: {result.output}")
+            _force_nocloud(ex, container_cache, pending.name, seed_dir=seed_dir)
+            pending.replace(vmdk)
+            ok(f"converted: {vmdk.stat().st_size / 2**30:.2f} GiB host")
+        return BaseImage(qcow2=qcow2, vmdk=vmdk, sha512=sha512)
+    except ImageCleanupError:
+        cleanup_safe = False
+        raise
+    except ExecError as exc:
+        raise ImageError(f"image preparation failed: {exc}") from exc
+    finally:
+        if cleanup_safe:
+            try:
+                for path in temporary:
+                    path.unlink(missing_ok=True)
+            finally:
+                lock.rmdir()
 
 
 def _force_nocloud(
@@ -138,28 +170,44 @@ def _force_nocloud(
       reads them from there unconditionally, no ISO/disk probing involved.
     """
     step("Pinning NoCloud datasource + seed on boot image")
-    copy_seed = ""
-    if seed_dir is not None:
-        copy_seed = (
-            "mkdir -p /mnt2/var/lib/cloud/seed/nocloud\n"
-            "cp /work/.seed/user-data /work/.seed/meta-data "
-            "/mnt2/var/lib/cloud/seed/nocloud/\n"
+    mount = f"/tmp/sidecar-image-{uuid.uuid4().hex}"
+    nbd = NbdSession(cast(Container, ex), index=1)
+    try:
+        disk = nbd.connect(f"{container_cache}/{vmdk_name}")
+        script = (
+            f"set -e\nmkdir -p {mount}\n"
+            f"mount -o rw {disk.partition(1)} {mount}\n"
+            "printf 'datasource_list: [ NoCloud ]\\n' > "
+            f"{mount}/etc/cloud/cloud.cfg.d/99-force-nocloud.cfg\n"
         )
-    script = (
-        "set -e\n"
-        f"qemu-nbd -c /dev/nbd1 '{container_cache}/{vmdk_name}'\n"
-        "sleep 1\n"
-        "partprobe /dev/nbd1 2>/dev/null || true\n"
-        "sleep 1\n"
-        "mknod /dev/nbd1p1 b 43 33 2>/dev/null || true\n"
-        "mkdir -p /mnt2\n"
-        "mkdir -p /work/.seed\n"
-        "mount -o rw /dev/nbd1p1 /mnt2\n"
-        "printf 'datasource_list: [ NoCloud ]\\n' > "
-        "/mnt2/etc/cloud/cloud.cfg.d/99-force-nocloud.cfg\n" + copy_seed + "umount /mnt2\n"
-        "qemu-nbd -d /dev/nbd1\n"
-    )
-    result = ex.run(script, timeout=900, check=False)
-    if result.exit_code != 0:
-        raise ImageError(f"NoCloud pinning failed: {result.output[-500:]}")
+        if seed_dir is not None:
+            source = f"{container_cache}/{seed_dir.name}"
+            script += (
+                f"mkdir -p {mount}/var/lib/cloud/seed/nocloud\n"
+                f"cp {shlex.quote(source + '/user-data')} "
+                f"{shlex.quote(source + '/meta-data')} {mount}/var/lib/cloud/seed/nocloud/\n"
+            )
+        result = ex.run(script, timeout=900, check=False)
+        if result.exit_code != 0:
+            raise ImageError(f"NoCloud pinning failed: {result.output[-500:]}")
+    finally:
+        try:
+            cleanup = ex.run(
+                f"if mountpoint -q {mount}; then umount {mount} || exit $?; fi; "
+                f"if test -d {mount}; then rmdir {mount}; fi",
+                timeout=120,
+                check=False,
+            )
+        except ExecError as exc:
+            raise ImageCleanupError(
+                "cannot verify boot image unmount; retained image and lock"
+            ) from exc
+        if cleanup.exit_code != 0:
+            raise ImageCleanupError("boot image unmount failed; container teardown is required")
+        try:
+            nbd.disconnect(check=False)
+        except (ExecError, NbdError) as exc:
+            raise ImageCleanupError(
+                "boot image disconnect failed; retained image and lock"
+            ) from exc
     ok("datasource pinned: NoCloud")

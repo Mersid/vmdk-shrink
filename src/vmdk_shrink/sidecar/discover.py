@@ -54,13 +54,15 @@ def _arp_table() -> dict[str, str]:
 
 
 def _ping_sweep(subnet: str, timeout_ms: int = 400) -> None:
-    """Ping the subnet's .1..254 (best effort, fire-and-forget).
+    """Ping the subnet hosts (best effort).
 
     ``cmd /c`` accepts ~8191 characters; one giant &-joined line silently
     dies with "input line too long" and never sends a single ping, so the
     sweep is chunked well under the limit.
     """
     network = ipaddress.IPv4Network(subnet)
+    if network.num_addresses > 4096:
+        raise IpDiscoveryError(f"refusing an unbounded ARP sweep of {subnet}; check DHCP leases")
     hosts = [str(h) for h in network.hosts()]
     per_cmd = 40
     for i in range(0, len(hosts), per_cmd):
@@ -146,11 +148,11 @@ def wait_for_guest_ip(
     mac = guest_mac_from_log(vmx)
     for attempt in range(1, attempts + 1):
         leased = guest_ip_from_leases(mac)
-        if leased:
+        if leased and ipaddress.IPv4Address(leased) in ipaddress.IPv4Network(subnet):
             info(f"guest discovered at [val]{leased}[/val] (DHCP lease, MAC {mac})")
             return leased
         table = _arp_table()
-        if mac in table:
+        if mac in table and ipaddress.IPv4Address(table[mac]) in ipaddress.IPv4Network(subnet):
             ip = table[mac]
             info(f"guest discovered at [val]{ip}[/val] (MAC {mac}, attempt {attempt})")
             return ip
@@ -166,13 +168,22 @@ def vmnet8_subnet() -> str:
     """The VMnet8 (NAT) subnet, read from the host's IP configuration."""
     out = subprocess.run(  # noqa: S603 - fixed argv
         ["ipconfig"], capture_output=True, text=True, timeout=30, check=False
-    ).stdout
+    )
+    if out.returncode != 0:
+        raise ExecError("could not read host IP configuration for VMnet8")
     current_adapter = ""
-    for line in out.splitlines():
-        if "adapter" in line:
+    address = ""
+    for line in out.stdout.splitlines():
+        if line and not line[0].isspace():
             current_adapter = line
+            address = ""
         match = re.search(r"IPv4.*?:\s*(\d+\.\d+\.\d+\.\d+)", line)
         if match and "VMnet8" in current_adapter:
-            network = ipaddress.IPv4Network(match.group(1) + "/24", strict=False)
-            return str(network)
-    raise ExecError("VMnet8 adapter not found; NAT networking required for sidecar mode")
+            address = match.group(1)
+        mask = re.search(r"Subnet Mask.*?:\s*(\d+\.\d+\.\d+\.\d+)", line)
+        if mask and address and "VMnet8" in current_adapter:
+            try:
+                return str(ipaddress.IPv4Network(f"{address}/{mask.group(1)}", strict=False))
+            except ValueError as exc:
+                raise ExecError("invalid VMnet8 address or subnet mask") from exc
+    raise ExecError("VMnet8 IPv4 address/netmask not found; NAT networking required")
